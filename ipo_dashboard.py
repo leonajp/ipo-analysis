@@ -3,11 +3,12 @@ IPO Operation Analysis Dashboard
 Streamlit app to explore IPOs by underwriter with multi-timeframe charts
 
 Features:
-- Filter by underwriter
+- Filter by underwriter (partial match)
 - View all IPOs for selected underwriter
 - 1-minute chart (Day 1)
 - Daily chart (First Month)
 - Daily chart (First Year)
+- Grid view of all IPO charts
 
 Requirements:
     pip install streamlit pandas plotly requests polygon-api-client
@@ -23,6 +24,154 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import os
+import re
+import json
+
+# Optional imports for live IPO fetching
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    HAS_SCRAPING = True
+except ImportError:
+    HAS_SCRAPING = False
+
+# ============================================================================
+# CONFIG / API KEY PERSISTENCE
+# ============================================================================
+CONFIG_FILE = os.path.expanduser("~/.ipo_dashboard_config.json")
+
+def load_config() -> dict:
+    """Load saved configuration including API keys (local file)."""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_config(config: dict):
+    """Save configuration to local file."""
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f)
+    except Exception as e:
+        pass  # Silently fail on cloud
+
+def inject_local_storage_js():
+    """Inject JavaScript for browser localStorage access."""
+    st.markdown("""
+    <script>
+    // Save API key to localStorage
+    window.saveApiKey = function(key) {
+        localStorage.setItem('polygon_api_key', key);
+    }
+    
+    // Load API key from localStorage
+    window.loadApiKey = function() {
+        return localStorage.getItem('polygon_api_key') || '';
+    }
+    
+    // Clear API key from localStorage  
+    window.clearApiKey = function() {
+        localStorage.removeItem('polygon_api_key');
+    }
+    
+    // On page load, send saved key to Streamlit via query params
+    (function() {
+        const savedKey = localStorage.getItem('polygon_api_key');
+        if (savedKey && !window.location.search.includes('polygon_key=')) {
+            // Check if we need to reload with the key
+            const urlParams = new URLSearchParams(window.location.search);
+            if (!urlParams.has('polygon_key')) {
+                urlParams.set('polygon_key', savedKey);
+                // Use a hidden input to communicate with Streamlit
+                const event = new CustomEvent('localStorageKey', { detail: savedKey });
+                window.dispatchEvent(event);
+            }
+        }
+    })();
+    </script>
+    """, unsafe_allow_html=True)
+
+def get_polygon_api_key() -> str:
+    """Get Polygon API key from various sources (priority order)."""
+    # 1. Check session state (user just entered it)
+    if st.session_state.get('polygon_api_key'):
+        return st.session_state.polygon_api_key
+    
+    # 2. Check query params (from localStorage redirect)
+    try:
+        params = st.query_params
+        if 'polygon_key' in params:
+            key = params['polygon_key']
+            if key:
+                st.session_state.polygon_api_key = key
+                return key
+    except Exception:
+        pass
+    
+    # 3. Check Streamlit secrets (for cloud deployment - shared key)
+    try:
+        if hasattr(st, 'secrets') and 'POLYGON_API_KEY' in st.secrets:
+            return st.secrets['POLYGON_API_KEY']
+    except Exception:
+        pass
+    
+    # 4. Check environment variable
+    if os.environ.get('POLYGON_API_KEY'):
+        return os.environ['POLYGON_API_KEY']
+    
+    # 5. Check saved config file (local persistence)
+    config = load_config()
+    if config.get('polygon_api_key'):
+        return config['polygon_api_key']
+    
+    return ''
+
+def save_polygon_api_key(key: str):
+    """Save Polygon API key to multiple storage locations."""
+    if key:
+        # Save to session state
+        st.session_state.polygon_api_key = key
+        os.environ['POLYGON_API_KEY'] = key
+        
+        # Save to local config file (works locally)
+        try:
+            config = load_config()
+            config['polygon_api_key'] = key
+            save_config(config)
+        except Exception:
+            pass
+        
+        # Save to browser localStorage via JavaScript
+        st.markdown(f"""
+        <script>
+        localStorage.setItem('polygon_api_key', '{key}');
+        </script>
+        """, unsafe_allow_html=True)
+
+def clear_polygon_api_key():
+    """Clear API key from all storage locations."""
+    # Clear session state
+    st.session_state.polygon_api_key = ''
+    if 'POLYGON_API_KEY' in os.environ:
+        del os.environ['POLYGON_API_KEY']
+    
+    # Clear local config
+    try:
+        config = load_config()
+        config.pop('polygon_api_key', None)
+        save_config(config)
+    except Exception:
+        pass
+    
+    # Clear browser localStorage
+    st.markdown("""
+    <script>
+    localStorage.removeItem('polygon_api_key');
+    </script>
+    """, unsafe_allow_html=True)
 
 # ============================================================================
 # PAGE CONFIG
@@ -33,6 +182,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ============================================================================
+# CSS OVERRIDES
+# ============================================================================
+def apply_custom_css():
+    """Apply custom CSS for better UX - larger dropdowns, etc."""
+    st.markdown(
+        """
+        <style>
+        /* Expand selectbox dropdown height (default is 300px) */
+        [data-testid="stSelectboxVirtualDropdown"] > div {
+            max-height: 480px !important;
+        }
+        
+        /* Make selectbox text slightly larger */
+        [data-testid="stSelectbox"] {
+            font-size: 0.95rem !important;
+        }
+        
+        /* Wider sidebar */
+        [data-testid="stSidebar"] {
+            min-width: 320px !important;
+        }
+        
+        /* Better table styling */
+        [data-testid="stDataFrame"] {
+            font-size: 0.85rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+apply_custom_css()
 
 # ============================================================================
 # DATA LOADING
@@ -253,7 +436,7 @@ def fetch_bars(ticker: str, start_date: str, end_date: str,
 # ============================================================================
 
 def create_candlestick_chart(df: pd.DataFrame, title: str, height: int = 400) -> go.Figure:
-    """Create a candlestick chart with volume."""
+    """Create a candlestick chart with volume and scrollable x-axis."""
     if df.empty:
         fig = go.Figure()
         fig.add_annotation(text="No data available", xref="paper", yref="paper",
@@ -310,10 +493,40 @@ def create_candlestick_chart(df: pd.DataFrame, title: str, height: int = 400) ->
             font_size=14
         ),
         height=height,
-        xaxis_rangeslider_visible=False,
         showlegend=False,
         margin=dict(l=50, r=50, t=80, b=50),
-        template='plotly_white'
+        template='plotly_white',
+        
+        # Enable range slider for scrolling
+        xaxis=dict(
+            rangeslider=dict(visible=False),  # Disable on price chart (use bottom one)
+            type='date',
+            tickformat='%Y-%m-%d %H:%M' if 'minute' in title.lower() or '1-min' in title.lower() else '%Y-%m-%d',
+        ),
+        xaxis2=dict(
+            rangeslider=dict(visible=True, thickness=0.05),  # Scrollable range slider
+            type='date',
+            tickformat='%Y-%m-%d',
+        ),
+        
+        # Enable zooming and panning
+        dragmode='zoom',
+    )
+    
+    # Add range selector buttons
+    fig.update_xaxes(
+        rangeselector=dict(
+            buttons=list([
+                dict(count=1, label="1D", step="day", stepmode="backward"),
+                dict(count=7, label="1W", step="day", stepmode="backward"),
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(step="all", label="All")
+            ]),
+            bgcolor='#f0f0f0',
+            font=dict(size=10),
+        ),
+        row=1, col=1
     )
     
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
@@ -345,7 +558,14 @@ def create_summary_chart(df: pd.DataFrame, title: str) -> go.Figure:
         height=200,
         margin=dict(l=40, r=40, t=40, b=30),
         template='plotly_white',
-        showlegend=False
+        showlegend=False,
+        xaxis=dict(
+            tickformat='%m/%d',
+            showgrid=True,
+        ),
+        yaxis=dict(
+            showgrid=True,
+        ),
     )
     
     return fig
@@ -357,7 +577,886 @@ def create_summary_chart(df: pd.DataFrame, title: str) -> go.Figure:
 
 def main():
     st.title("📈 IPO Operation Analysis Dashboard")
+    
+    # Create tabs for different views
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Analysis", "🆕 Upcoming IPOs", "📈 Statistics & Prediction", "ℹ️ About"])
+    
+    with tab1:
+        analysis_page()
+    
+    with tab2:
+        upcoming_ipos_page()
+    
+    with tab3:
+        statistics_page()
+    
+    with tab4:
+        about_page()
+
+
+def statistics_page():
+    """Statistical analysis page with correlation, regression, and predictions."""
+    st.header("📈 Statistics & Prediction")
+    
+    # Load data
+    df = load_ipo_data()
+    if df.empty:
+        st.warning("No data loaded")
+        return
+    
+    # Prepare numeric columns for analysis
+    numeric_cols = ['IPO Sh Px', 'IPO Sh Offered', 'lifetime_hi_vs_ipo', 
+                    'ret_d1', 'operation_risk_score']
+    
+    # Add derived columns if not present
+    if 'market_cap_mm' not in df.columns and 'IPO Sh Px' in df.columns and 'IPO Sh Offered' in df.columns:
+        df['market_cap_mm'] = (df['IPO Sh Px'] * df['IPO Sh Offered']) / 1_000_000
+    
+    if 'log_shares' not in df.columns and 'IPO Sh Offered' in df.columns:
+        df['log_shares'] = np.log1p(df['IPO Sh Offered'])
+    
+    # Sub-tabs for different analyses
+    stat_tab1, stat_tab2, stat_tab3, stat_tab4 = st.tabs([
+        "📊 Correlation", "📈 Regression", "🎯 Prediction", "📋 Factor Analysis"
+    ])
+    
+    # ========================================================================
+    # TAB 1: CORRELATION ANALYSIS
+    # ========================================================================
+    with stat_tab1:
+        st.subheader("Correlation Matrix")
+        
+        # Select columns for correlation
+        available_numeric = [col for col in df.columns if df[col].dtype in ['float64', 'int64', 'float32', 'int32']]
+        
+        default_cols = ['IPO Sh Px', 'IPO Sh Offered', 'lifetime_hi_vs_ipo', 'ret_d1', 'operation_risk_score']
+        default_cols = [c for c in default_cols if c in available_numeric]
+        
+        selected_cols = st.multiselect(
+            "Select variables for correlation",
+            options=available_numeric,
+            default=default_cols[:6]
+        )
+        
+        if len(selected_cols) >= 2:
+            corr_df = df[selected_cols].corr()
+            
+            # Heatmap
+            fig = go.Figure(data=go.Heatmap(
+                z=corr_df.values,
+                x=corr_df.columns,
+                y=corr_df.columns,
+                colorscale='RdBu_r',
+                zmid=0,
+                text=np.round(corr_df.values, 2),
+                texttemplate='%{text}',
+                textfont={"size": 10},
+                hoverongaps=False
+            ))
+            
+            fig.update_layout(
+                title='Correlation Heatmap',
+                height=500,
+                xaxis_tickangle=-45
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Key correlations with bounce
+            if 'lifetime_hi_vs_ipo' in selected_cols:
+                st.markdown("### Key Correlations with Lifetime Bounce")
+                bounce_corr = corr_df['lifetime_hi_vs_ipo'].drop('lifetime_hi_vs_ipo').sort_values(key=abs, ascending=False)
+                
+                for var, corr in bounce_corr.items():
+                    direction = "📈" if corr > 0 else "📉"
+                    strength = "Strong" if abs(corr) > 0.3 else "Moderate" if abs(corr) > 0.15 else "Weak"
+                    st.write(f"{direction} **{var}**: {corr:.3f} ({strength})")
+    
+    # ========================================================================
+    # TAB 2: REGRESSION ANALYSIS
+    # ========================================================================
+    with stat_tab2:
+        st.subheader("Regression Analysis: Predicting Bounce")
+        
+        try:
+            from scipy import stats
+            
+            # Simple OLS regression
+            st.markdown("### Simple Linear Regression")
+            
+            # Select predictor
+            predictors = ['IPO Sh Px', 'IPO Sh Offered', 'operation_risk_score', 'market_cap_mm']
+            predictors = [p for p in predictors if p in df.columns]
+            
+            if predictors and 'lifetime_hi_vs_ipo' in df.columns:
+                x_var = st.selectbox("Select Predictor (X)", predictors)
+                
+                # Clean data
+                reg_df = df[[x_var, 'lifetime_hi_vs_ipo']].dropna()
+                reg_df = reg_df[reg_df['lifetime_hi_vs_ipo'] < 5000]  # Remove extreme outliers
+                
+                if len(reg_df) > 10:
+                    X = reg_df[x_var].values
+                    y = reg_df['lifetime_hi_vs_ipo'].values
+                    
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(X, y)
+                    
+                    # Display results
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("R²", f"{r_value**2:.3f}")
+                    col2.metric("Slope", f"{slope:.3f}")
+                    col3.metric("P-value", f"{p_value:.4f}")
+                    col4.metric("Std Error", f"{std_err:.3f}")
+                    
+                    # Scatter plot with regression line
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=X, y=y,
+                        mode='markers',
+                        name='Data',
+                        marker=dict(size=5, opacity=0.5)
+                    ))
+                    
+                    x_line = np.linspace(X.min(), X.max(), 100)
+                    y_line = slope * x_line + intercept
+                    
+                    fig.add_trace(go.Scatter(
+                        x=x_line, y=y_line,
+                        mode='lines',
+                        name=f'y = {slope:.2f}x + {intercept:.2f}',
+                        line=dict(color='red', width=2)
+                    ))
+                    
+                    fig.update_layout(
+                        title=f'{x_var} vs Lifetime Bounce',
+                        xaxis_title=x_var,
+                        yaxis_title='Lifetime Bounce (%)',
+                        height=400
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Interpretation
+                    st.markdown("### Interpretation")
+                    if p_value < 0.05:
+                        st.success(f"✅ Statistically significant (p={p_value:.4f})")
+                        if slope > 0:
+                            st.write(f"Higher {x_var} → Higher bounce (positive relationship)")
+                        else:
+                            st.write(f"Higher {x_var} → Lower bounce (negative relationship)")
+                    else:
+                        st.warning(f"⚠️ Not statistically significant (p={p_value:.4f})")
+                    
+        except ImportError:
+            st.warning("Install scipy for regression analysis: pip install scipy")
+    
+    # ========================================================================
+    # TAB 3: PREDICTION MODEL
+    # ========================================================================
+    with stat_tab3:
+        st.subheader("🎯 Bounce Prediction Model")
+        
+        st.markdown("""
+        This model predicts likely bounce range based on IPO characteristics.
+        Uses historical data to estimate probability distributions.
+        """)
+        
+        # Input form for prediction
+        st.markdown("### Enter IPO Details")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            pred_price = st.number_input("IPO Price ($)", min_value=1.0, max_value=50.0, value=4.0)
+            pred_shares = st.number_input("Shares Offered (M)", min_value=0.5, max_value=10.0, value=1.5)
+            pred_country = st.selectbox("Country", ["US", "Tax Haven (KY, VG)", "Other"])
+        
+        with col2:
+            pred_underwriter = st.selectbox("Underwriter Type", ["Operation UW", "Neutral", "Legit UW"])
+            pred_vc = st.selectbox("VC Backed?", ["No", "Yes"])
+        
+        if st.button("🔮 Predict Bounce"):
+            # Calculate risk score
+            risk_score = 0
+            
+            if pred_price <= 5:
+                risk_score += 15
+            if pred_shares <= 1.5:
+                risk_score += 15
+            elif pred_shares <= 2.5:
+                risk_score += 10
+            if pred_country == "Tax Haven (KY, VG)":
+                risk_score += 15
+            elif pred_country == "US":
+                risk_score -= 5
+            if pred_underwriter == "Operation UW":
+                risk_score += 10
+            elif pred_underwriter == "Legit UW":
+                risk_score -= 10
+            if pred_vc == "No":
+                risk_score += 10
+            
+            # Find similar IPOs
+            similar_mask = (
+                (df['IPO Sh Px'] >= pred_price - 2) & 
+                (df['IPO Sh Px'] <= pred_price + 2) &
+                (df['operation_risk_score'] >= risk_score - 10) &
+                (df['operation_risk_score'] <= risk_score + 10)
+            )
+            similar_df = df[similar_mask]
+            
+            if len(similar_df) < 5:
+                # Fallback to risk score only
+                similar_mask = (
+                    (df['operation_risk_score'] >= risk_score - 15) &
+                    (df['operation_risk_score'] <= risk_score + 15)
+                )
+                similar_df = df[similar_mask]
+            
+            st.markdown("---")
+            st.markdown("### Prediction Results")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Risk Score", f"{risk_score}")
+                risk_level = "🔴 High" if risk_score >= 40 else "🟡 Medium" if risk_score >= 25 else "🟢 Low"
+                st.write(f"Risk Level: {risk_level}")
+            
+            with col2:
+                if len(similar_df) > 0:
+                    median_bounce = similar_df['lifetime_hi_vs_ipo'].median()
+                    st.metric("Expected Median Bounce", f"{median_bounce:.0f}%")
+                else:
+                    st.metric("Expected Median Bounce", "N/A")
+            
+            with col3:
+                if len(similar_df) > 0:
+                    pct_100 = (similar_df['lifetime_hi_vs_ipo'] > 100).mean() * 100
+                    st.metric("P(Bounce > 100%)", f"{pct_100:.0f}%")
+                else:
+                    st.metric("P(Bounce > 100%)", "N/A")
+            
+            # Distribution of similar IPOs
+            if len(similar_df) > 5:
+                st.markdown(f"### Distribution of {len(similar_df)} Similar IPOs")
+                
+                fig = go.Figure()
+                fig.add_trace(go.Histogram(
+                    x=similar_df['lifetime_hi_vs_ipo'].clip(upper=2000),
+                    nbinsx=30,
+                    name='Bounce Distribution'
+                ))
+                
+                fig.add_vline(x=similar_df['lifetime_hi_vs_ipo'].median(), 
+                             line_dash="dash", line_color="red",
+                             annotation_text="Median")
+                
+                fig.update_layout(
+                    title='Bounce Distribution for Similar IPOs',
+                    xaxis_title='Lifetime Bounce (%)',
+                    yaxis_title='Count',
+                    height=300
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Percentiles
+                st.markdown("### Bounce Percentiles")
+                percentiles = [10, 25, 50, 75, 90]
+                pct_values = np.percentile(similar_df['lifetime_hi_vs_ipo'].dropna(), percentiles)
+                
+                pct_df = pd.DataFrame({
+                    'Percentile': [f'{p}th' for p in percentiles],
+                    'Bounce (%)': [f'{v:.0f}%' for v in pct_values]
+                })
+                st.dataframe(pct_df, use_container_width=True, hide_index=True)
+    
+    # ========================================================================
+    # TAB 4: FACTOR ANALYSIS
+    # ========================================================================
+    with stat_tab4:
+        st.subheader("📋 Factor Analysis by Category")
+        
+        # By Underwriter
+        st.markdown("### Bounce by Underwriter (Top 20)")
+        
+        uw_stats = df.groupby('underwriter').agg({
+            'lifetime_hi_vs_ipo': ['median', 'mean', 'count'],
+            'operation_risk_score': 'mean'
+        }).reset_index()
+        uw_stats.columns = ['Underwriter', 'Median Bounce', 'Mean Bounce', 'Count', 'Avg Risk']
+        uw_stats = uw_stats[uw_stats['Count'] >= 3].sort_values('Median Bounce', ascending=False).head(20)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=uw_stats['Underwriter'].str[:30],
+            y=uw_stats['Median Bounce'],
+            text=uw_stats['Count'].apply(lambda x: f'n={x}'),
+            textposition='outside',
+            marker_color=uw_stats['Avg Risk'],
+            marker_colorscale='RdYlGn_r',
+            marker_showscale=True,
+            marker_colorbar_title='Risk'
+        ))
+        
+        fig.update_layout(
+            title='Median Bounce by Underwriter (color = avg risk score)',
+            xaxis_tickangle=-45,
+            height=500,
+            yaxis_title='Median Bounce (%)'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # By Country
+        if 'Cntry Terrtry Of Inc' in df.columns:
+            st.markdown("### Bounce by Country (Top 15)")
+            
+            country_stats = df.groupby('Cntry Terrtry Of Inc').agg({
+                'lifetime_hi_vs_ipo': ['median', 'mean', 'count']
+            }).reset_index()
+            country_stats.columns = ['Country', 'Median Bounce', 'Mean Bounce', 'Count']
+            country_stats = country_stats[country_stats['Count'] >= 5].sort_values('Median Bounce', ascending=False).head(15)
+            
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=country_stats['Country'],
+                y=country_stats['Median Bounce'],
+                text=country_stats['Count'].apply(lambda x: f'n={x}'),
+                textposition='outside'
+            ))
+            
+            fig.update_layout(
+                title='Median Bounce by Country of Incorporation',
+                height=400,
+                yaxis_title='Median Bounce (%)'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # By Price Bucket
+        st.markdown("### Bounce by IPO Price Range")
+        
+        df['price_bucket'] = pd.cut(df['IPO Sh Px'], bins=[0, 4, 5, 8, 10, 50], 
+                                     labels=['$0-4', '$4-5', '$5-8', '$8-10', '$10+'])
+        
+        price_stats = df.groupby('price_bucket').agg({
+            'lifetime_hi_vs_ipo': ['median', 'count']
+        }).reset_index()
+        price_stats.columns = ['Price Range', 'Median Bounce', 'Count']
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=price_stats['Price Range'].astype(str),
+            y=price_stats['Median Bounce'],
+            text=price_stats['Count'].apply(lambda x: f'n={x}'),
+            textposition='outside',
+            marker_color=['#ef5350', '#ff9800', '#ffeb3b', '#8bc34a', '#4caf50']
+        ))
+        
+        fig.update_layout(
+            title='Median Bounce by IPO Price Range',
+            height=350,
+            yaxis_title='Median Bounce (%)'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Summary Table
+        st.markdown("### Summary Statistics by Risk Level")
+        
+        df['risk_level'] = pd.cut(df['operation_risk_score'], 
+                                   bins=[-1, 25, 40, 100],
+                                   labels=['Low Risk', 'Medium Risk', 'High Risk'])
+        
+        risk_stats = df.groupby('risk_level').agg({
+            'lifetime_hi_vs_ipo': ['median', 'mean', 'std', 'count'],
+            'IPO Sh Px': 'mean',
+            'IPO Sh Offered': 'mean'
+        }).reset_index()
+        
+        risk_stats.columns = ['Risk Level', 'Median Bounce', 'Mean Bounce', 'Std Dev', 'Count', 'Avg Price', 'Avg Shares']
+        
+        for col in ['Median Bounce', 'Mean Bounce', 'Std Dev']:
+            risk_stats[col] = risk_stats[col].apply(lambda x: f'{x:.0f}%')
+        risk_stats['Avg Price'] = risk_stats['Avg Price'].apply(lambda x: f'${x:.2f}')
+        risk_stats['Avg Shares'] = risk_stats['Avg Shares'].apply(lambda x: f'{x/1e6:.1f}M')
+        
+        st.dataframe(risk_stats, use_container_width=True, hide_index=True)
+
+
+def about_page():
+    """About page with data sources and methodology."""
+    st.header("ℹ️ About This Dashboard")
+    
+    st.markdown("""
+    ### Data Sources
+    - **Historical IPO Data**: Bloomberg EQS + Polygon.io
+    - **Upcoming IPOs**: IPOScoop, Nasdaq, NYSE, Yahoo Finance
+    
+    ### Risk Score Methodology
+    | Factor | Points |
+    |--------|--------|
+    | IPO Price ≤ $5 | +15 |
+    | Shares Offered ≤ 1.5M | +15 |
+    | Tax Haven Country (KY, VG, etc.) | +15 |
+    | Operation Underwriter | +10 |
+    | No VC Backing | +10 |
+    | Legit Underwriter (Goldman, etc.) | -10 |
+    | US Company | -5 |
+    
+    ### Tax Haven Countries
+    KY (Cayman), VG (BVI), MH (Marshall Islands), CY (Cyprus), MU (Mauritius), PA (Panama), JE (Jersey), GG (Guernsey)
+    
+    ### Operation Underwriters
+    D Boral, Kingswood, US Tiger, Prime Number, Network 1, EF Hutton, Bancroft, Cathay, RVRS, Viewtrade, Joseph Stone, Boustead, Maxim, Dawson, Revere, Dominari, Craft Capital
+    """)
+
+
+def upcoming_ipos_page():
+    """Page for upcoming IPOs with data from various sources."""
+    st.header("🆕 Upcoming IPOs")
+    
+    st.markdown("""
+    ### IPO Data Sources
+    | Source | URL | Notes |
+    |--------|-----|-------|
+    | IPOScoop | [iposcoop.com](https://www.iposcoop.com/ipo-calendar/) | Best for small IPOs |
+    | Nasdaq | [nasdaq.com/market-activity/ipos](https://www.nasdaq.com/market-activity/ipos) | Official Nasdaq listings |
+    | NYSE | [nyse.com/ipo-center](https://www.nyse.com/ipo-center/filings) | Official NYSE listings |
+    | Yahoo Finance | [finance.yahoo.com/calendar/ipo](https://finance.yahoo.com/calendar/ipo) | Good calendar view |
+    | StockAnalysis | [stockanalysis.com/ipos/calendar](https://stockanalysis.com/ipos/calendar/) | Fast updates |
+    """)
+    
+    st.markdown("---")
+    
+    # Manual refresh button
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔄 Refresh Data"):
+            st.cache_data.clear()
+            st.rerun()
+    
+    # Try to fetch upcoming IPOs
+    st.subheader("📅 This Week's IPOs")
+    
+    upcoming_df = fetch_upcoming_ipos()
+    
+    if upcoming_df is not None and len(upcoming_df) > 0:
+        st.dataframe(upcoming_df, use_container_width=True, hide_index=True)
+        
+        # Alert section
+        st.markdown("---")
+        st.subheader("🔔 IPO Alerts")
+        st.info("To receive alerts for new IPOs, you can:")
+        st.markdown("""
+        1. **Email alerts**: Set up with IPOScoop Pro
+        2. **Bloomberg alerts**: Use `EVTS` function
+        3. **Custom script**: Run `ipo_alert.py` (see below)
+        """)
+    else:
+        st.warning("Could not fetch upcoming IPO data. Check the sources above manually.")
+        
+        # Show sample data structure
+        st.markdown("### Expected Data Format")
+        sample_data = pd.DataFrame({
+            'Date': ['2025-12-10', '2025-12-11', '2025-12-12'],
+            'Company': ['Sample Corp', 'Test Holdings', 'Demo Inc'],
+            'Ticker': ['SMPL', 'TEST', 'DEMO'],
+            'Price Range': ['$4-5', '$8-10', '$5-6'],
+            'Shares (M)': [1.5, 2.0, 1.0],
+            'Underwriter': ['D Boral', 'Maxim', 'EF Hutton'],
+            'Exchange': ['NASDAQ', 'NASDAQ', 'NYSE']
+        })
+        st.dataframe(sample_data, use_container_width=True, hide_index=True)
+    
+    # Instructions for setting up alerts
+    st.markdown("---")
+    st.subheader("⚡ Setting Up Automated Alerts")
+    
+    with st.expander("Python Alert Script", expanded=False):
+        st.code('''
+# ipo_alert.py - Run every 30 min via Task Scheduler or cron
+import requests
+from bs4 import BeautifulSoup
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime
+
+def check_iposcoop():
+    """Scrape IPOScoop for today's IPOs."""
+    url = "https://www.iposcoop.com/ipo-calendar/"
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    
+    # Parse the calendar table
+    # ... (implementation depends on their HTML structure)
+    
+    return today_ipos
+
+def send_alert(ipos):
+    """Send email/SMS alert for new IPOs."""
+    # Configure your email settings
+    msg = MIMEText(f"New IPOs today: {ipos}")
+    msg['Subject'] = f"🚨 IPO Alert - {datetime.now().strftime('%Y-%m-%d')}"
+    # ... send email
+    
+if __name__ == "__main__":
+    ipos = check_iposcoop()
+    if ipos:
+        send_alert(ipos)
+        print(f"Alert sent for: {ipos}")
+''', language='python')
+    
+    with st.expander("PySide6 Desktop Alert Window", expanded=False):
+        st.code('''
+# ipo_alert_gui.py - Desktop notification window
+from PySide6.QtWidgets import QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+from PySide6.QtCore import QTimer
+import sys
+
+class IPOAlertWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IPO Alerts")
+        self.setGeometry(100, 100, 800, 400)
+        
+        # Create table
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "Date", "Ticker", "Company", "Price", "Shares", "Underwriter", "Exchange"
+        ])
+        
+        # Layout
+        layout = QVBoxLayout()
+        layout.addWidget(self.table)
+        
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+        
+        # Auto-refresh every 30 min
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh_data)
+        self.timer.start(30 * 60 * 1000)  # 30 minutes
+        
+        self.refresh_data()
+    
+    def refresh_data(self):
+        """Fetch and display upcoming IPOs."""
+        # Fetch from IPOScoop, etc.
+        # Update table rows
+        pass
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = IPOAlertWindow()
+    window.show()
+    sys.exit(app.exec())
+''', language='python')
+
+
+@st.cache_data(ttl=1800)  # Cache for 30 minutes
+def fetch_upcoming_ipos():
+    """Fetch upcoming IPOs from various sources - LIVE."""
+    
+    if not HAS_SCRAPING:
+        st.warning("Install requests and beautifulsoup4 for live IPO data: pip install requests beautifulsoup4")
+        return None
+    
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    
+    all_ipos = []
+    
+    # Source 1: Nasdaq API
+    try:
+        resp = requests.get(
+            "https://api.nasdaq.com/api/ipo/calendar",
+            headers={**HEADERS, 'Accept': 'application/json'},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            
+            # Upcoming IPOs
+            if 'data' in data and 'upcoming' in data['data']:
+                for ipo in data['data']['upcoming'].get('rows', []):
+                    all_ipos.append({
+                        'Date': ipo.get('expectedPriceDate', ''),
+                        'Company': ipo.get('companyName', ''),
+                        'Ticker': ipo.get('proposedTickerSymbol', ''),
+                        'Price': ipo.get('proposedSharePrice', ''),
+                        'Shares': ipo.get('sharesOffered', ''),
+                        'Exchange': ipo.get('proposedExchange', ''),
+                        'Status': 'Upcoming',
+                        'Source': 'Nasdaq'
+                    })
+            
+            # Priced (recent)
+            if 'data' in data and 'priced' in data['data']:
+                for ipo in data['data']['priced'].get('rows', [])[:10]:  # Last 10
+                    all_ipos.append({
+                        'Date': ipo.get('pricedDate', ''),
+                        'Company': ipo.get('companyName', ''),
+                        'Ticker': ipo.get('proposedTickerSymbol', ''),
+                        'Price': ipo.get('proposedSharePrice', ''),
+                        'Shares': ipo.get('sharesOffered', ''),
+                        'Exchange': ipo.get('proposedExchange', ''),
+                        'Status': 'Priced',
+                        'Source': 'Nasdaq'
+                    })
+    except Exception as e:
+        st.warning(f"Nasdaq API error: {e}")
+    
+    # Source 2: IPOScoop (scrape)
+    # Columns: Company(0) | Symbol(1) | Lead Managers(2) | Shares(3) | Price Low(4) | Price High(5) | Est $ Vol(6) | Expected to Trade(7)
+    try:
+        resp = requests.get(
+            "https://www.iposcoop.com/ipo-calendar/",
+            headers=HEADERS,
+            timeout=10
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            table = soup.find('table')
+            
+            if table:
+                for tr in table.find_all('tr')[1:25]:  # Skip header
+                    cells = tr.find_all(['td', 'th'])
+                    if len(cells) >= 8:
+                        company = cells[0].get_text(strip=True)
+                        ticker = cells[1].get_text(strip=True)
+                        underwriter = cells[2].get_text(strip=True)
+                        shares = cells[3].get_text(strip=True)
+                        price_low = cells[4].get_text(strip=True)
+                        price_high = cells[5].get_text(strip=True)
+                        date = cells[7].get_text(strip=True) if len(cells) > 7 else 'TBD'
+                        
+                        # Combine price range
+                        if price_low and price_high and price_low != price_high:
+                            price = f"${price_low}-${price_high}"
+                        elif price_low:
+                            price = f"${price_low}"
+                        else:
+                            price = ''
+                        
+                        # Skip header rows
+                        if not ticker or ticker.upper() in ['SYMBOL', 'TICKER', 'SYMBOL PROPOSED']:
+                            continue
+                        
+                        # Skip duplicates from Nasdaq
+                        if not any(ipo['Ticker'] == ticker for ipo in all_ipos):
+                            all_ipos.append({
+                                'Date': date,
+                                'Company': company,
+                                'Ticker': ticker,
+                                'Price': price,
+                                'Shares': shares,
+                                'Underwriter': underwriter,
+                                'Exchange': '',
+                                'Status': 'Upcoming',
+                                'Source': 'IPOScoop'
+                            })
+    except Exception as e:
+        st.warning(f"IPOScoop error: {e}")
+    
+    if all_ipos:
+        return pd.DataFrame(all_ipos)
+    return None
+
+
+def analysis_page():
+    """Main analysis page with underwriter filtering and charts."""
     st.markdown("*Explore small IPOs by underwriter with multi-timeframe charts*")
+    
+    # Initialize session state
+    if 'detailed_ipo' not in st.session_state:
+        st.session_state.detailed_ipo = None
+    if 'polygon_api_key' not in st.session_state:
+        st.session_state.polygon_api_key = get_polygon_api_key()
+    
+    # ========================================================================
+    # DETAILED VIEW POPUP - SHOW AT TOP IF SELECTED
+    # ========================================================================
+    if st.session_state.detailed_ipo:
+        ipo = st.session_state.detailed_ipo
+        
+        # Very prominent container
+        st.markdown("""
+        <style>
+        .stAlert {border: 3px solid #1f77b4 !important; background-color: #e6f3ff !important;}
+        </style>
+        """, unsafe_allow_html=True)
+        
+        st.warning(f"📊 **DETAILED VIEW OPEN** - Scroll down to see chart, or click Close when done")
+        
+        with st.container():
+            st.subheader(f"📊 {ipo['ticker']} - {ipo['name'][:40]}")
+            
+            # Close button at top - very prominent
+            close_col1, close_col2, close_col3 = st.columns([1, 2, 3])
+            with close_col1:
+                if st.button("❌ CLOSE", key="close_detail_top", type="primary"):
+                    st.session_state.detailed_ipo = None
+                    st.rerun()
+            with close_col2:
+                st.markdown(f"**IPO:** {ipo['date'].strftime('%Y-%m-%d')} | **Price:** ${ipo['price']:.2f}")
+            with close_col3:
+                st.link_button(f"📈 View {ipo['ticker']} on Yahoo Finance", 
+                              f"https://finance.yahoo.com/quote/{ipo['ticker']}")
+            
+            st.markdown("---")
+            
+            # Data source selection
+            st.markdown("#### Select Data Source & Timeframe")
+            src_col1, src_col2, src_col3 = st.columns(3)
+            
+            with src_col1:
+                detail_source = st.radio(
+                    "Data Source:",
+                    ["Sample (Demo)", "Polygon API (Live)"],
+                    key="detail_source_top",
+                    horizontal=True
+                )
+            
+            with src_col2:
+                if "Polygon" in detail_source:
+                    saved_key = get_polygon_api_key()
+                    if saved_key:
+                        st.success("✅ Using your saved Polygon key")
+                    else:
+                        st.error("⚠️ Add Polygon API key in sidebar first!")
+            
+            with src_col3:
+                timeframe = st.selectbox(
+                    "Timeframe:",
+                    ["1 Minute", "5 Minute", "15 Minute", "1 Hour", "1 Day"],
+                    key="detail_timeframe_top"
+                )
+            
+            # Date range
+            date_col1, date_col2, date_col3 = st.columns(3)
+            with date_col1:
+                start_date = st.date_input(
+                    "Start Date",
+                    value=ipo['date'].date(),
+                    key="detail_start_top"
+                )
+            with date_col2:
+                default_end = min(ipo['date'] + timedelta(days=30), datetime.now())
+                end_date = st.date_input(
+                    "End Date", 
+                    value=default_end.date(),
+                    key="detail_end_top"
+                )
+            with date_col3:
+                load_btn = st.button("🔄 LOAD CHART", key="load_chart_top", type="primary")
+            
+            # Load and display chart
+            if load_btn:
+                with st.spinner("Fetching data..."):
+                    tf_map = {
+                        "1 Minute": ("minute", 1),
+                        "5 Minute": ("minute", 5),
+                        "15 Minute": ("minute", 15),
+                        "1 Hour": ("hour", 1),
+                        "1 Day": ("day", 1)
+                    }
+                    tf, mult = tf_map.get(timeframe, ("day", 1))
+                    
+                    polygon_key = get_polygon_api_key()
+                    
+                    if "Polygon" in detail_source and polygon_key:
+                        # Fetch from Polygon
+                        try:
+                            url = f"https://api.polygon.io/v2/aggs/ticker/{ipo['ticker']}/range/{mult}/{tf}/{start_date}/{end_date}"
+                            params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": polygon_key}
+                            resp = requests.get(url, params=params, timeout=30)
+                            
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                if 'results' in data and data['results']:
+                                    bars = pd.DataFrame(data['results'])
+                                    bars['timestamp'] = pd.to_datetime(bars['t'], unit='ms')
+                                    bars = bars.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
+                                    bars = bars[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                                else:
+                                    st.error("No data returned from Polygon")
+                                    bars = pd.DataFrame()
+                            else:
+                                st.error(f"Polygon API error: {resp.status_code}")
+                                bars = pd.DataFrame()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                            bars = pd.DataFrame()
+                    else:
+                        # Generate sample data
+                        bars = fetch_bars(ipo['ticker'], str(start_date), str(end_date), tf, ipo['price'], "sample")
+                    
+                    if bars is not None and not bars.empty:
+                        # Create candlestick chart
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                           vertical_spacing=0.03, row_heights=[0.7, 0.3])
+                        
+                        fig.add_trace(go.Candlestick(
+                            x=bars['timestamp'], open=bars['open'], high=bars['high'],
+                            low=bars['low'], close=bars['close'], name='Price',
+                            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+                        ), row=1, col=1)
+                        
+                        # IPO price line
+                        fig.add_hline(y=ipo['price'], line_dash="dash", line_color="blue",
+                                     annotation_text=f"IPO ${ipo['price']:.2f}", row=1, col=1)
+                        
+                        # Volume
+                        colors = ['#26a69a' if bars['close'].iloc[i] >= bars['open'].iloc[i] else '#ef5350' 
+                                  for i in range(len(bars))]
+                        fig.add_trace(go.Bar(x=bars['timestamp'], y=bars['volume'], 
+                                            marker_color=colors, opacity=0.7, name='Volume'), row=2, col=1)
+                        
+                        # Stats
+                        max_price = bars['high'].max()
+                        min_price = bars['low'].min()
+                        pct_from_ipo = (max_price / ipo['price'] - 1) * 100
+                        
+                        fig.update_layout(
+                            title=f"{ipo['ticker']} - {timeframe} | High: ${max_price:.2f} (+{pct_from_ipo:.0f}%) | Low: ${min_price:.2f}",
+                            height=500, showlegend=False, template='plotly_white',
+                            xaxis2=dict(rangeslider=dict(visible=True, thickness=0.05))
+                        )
+                        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+                        fig.update_yaxes(title_text="Volume", row=2, col=1)
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Stats row
+                        st_col1, st_col2, st_col3, st_col4 = st.columns(4)
+                        with st_col1:
+                            st.metric("Data Points", len(bars))
+                        with st_col2:
+                            st.metric("High", f"${max_price:.2f}")
+                        with st_col3:
+                            st.metric("Low", f"${min_price:.2f}")
+                        with st_col4:
+                            pct = (bars['close'].iloc[-1] / bars['open'].iloc[0] - 1) * 100
+                            st.metric("Period Change", f"{pct:+.1f}%")
+                    else:
+                        st.error("No data available. Try different dates or check API key.")
+            
+            # Another close button at bottom
+            st.markdown("---")
+            if st.button("❌ Close Detailed View", key="close_detail_bottom"):
+                st.session_state.detailed_ipo = None
+                st.rerun()
+        
+        st.markdown("---")
+        st.markdown("---")
     
     # Load data
     df = load_ipo_data()
@@ -452,34 +1551,127 @@ def main():
         help="Select your market data source. 'sample' generates demo data."
     )
     
-    if data_source == "polygon":
-        api_key = st.sidebar.text_input("Polygon API Key", type="password")
-        if api_key:
-            os.environ['POLYGON_API_KEY'] = api_key
+    # Polygon API key (always show, syncs with session state)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔑 Your API Key")
+    st.sidebar.caption("Each user saves their own key in browser")
+    
+    # Load saved key
+    saved_key = get_polygon_api_key()
+    
+    # Show masked key if exists
+    if saved_key:
+        st.sidebar.success("✅ Your Polygon key is saved")
+        st.sidebar.caption(f"Key: {saved_key[:6]}...{saved_key[-4:]}" if len(saved_key) > 10 else "Key saved")
+        
+        show_key = st.sidebar.checkbox("Show/Edit Key", value=False, key="show_edit_key")
+        if show_key:
+            new_key = st.sidebar.text_input(
+                "Polygon API Key", 
+                value=saved_key,
+                type="password",
+                key="edit_polygon_key",
+                help="Get a free key at polygon.io"
+            )
+            if new_key and new_key != saved_key:
+                save_polygon_api_key(new_key)
+                st.sidebar.success("✅ Key updated!")
+                st.rerun()
+        
+        if st.sidebar.button("🗑️ Clear My Saved Key", key="clear_key_btn"):
+            clear_polygon_api_key()
+            st.rerun()
+    else:
+        st.sidebar.info("💡 Get a free API key at [polygon.io](https://polygon.io)")
+        polygon_key = st.sidebar.text_input(
+            "Polygon API Key", 
+            value='',
+            type="password",
+            key="new_polygon_key",
+            help="Your key is saved in YOUR browser only - not shared"
+        )
+        if polygon_key:
+            save_polygon_api_key(polygon_key)
+            st.sidebar.success("✅ Key saved to your browser!")
+            st.rerun()
     
     st.sidebar.markdown("---")
     
-    # Get underwriters with deal counts
-    uw_counts = df.groupby('underwriter').agg({
-        'Ticker': 'count',
-        'lifetime_hi_vs_ipo': 'median',
-        'operation_risk_score': 'mean'
-    }).reset_index()
-    uw_counts.columns = ['underwriter', 'num_deals', 'median_bounce', 'avg_risk']
-    uw_counts = uw_counts.sort_values('num_deals', ascending=False)
+    # ========================================================================
+    # UNDERWRITER SELECTION - Extract individual underwriters from combos
+    # ========================================================================
     
-    # Create display labels
-    uw_options = [f"{row['underwriter'][:40]} ({row['num_deals']} deals)" 
-                  for _, row in uw_counts.iterrows()]
-    uw_map = dict(zip(uw_options, uw_counts['underwriter']))
+    # Extract all unique individual underwriters from combo strings
+    def extract_underwriters(uw_series):
+        """Extract individual underwriters from comma-separated strings."""
+        all_uws = set()
+        for uw in uw_series.dropna().unique():
+            # Split by comma and clean
+            parts = re.split(r'[,/]', str(uw))
+            for part in parts:
+                clean = part.strip()
+                if clean and clean != 'Unknown':
+                    all_uws.add(clean)
+        return sorted(all_uws)
+    
+    individual_uws = extract_underwriters(df['underwriter'])
+    
+    # Count IPOs for each individual underwriter (partial match)
+    uw_counts = {}
+    for uw in individual_uws:
+        count = df['underwriter'].str.contains(uw, case=False, na=False, regex=False).sum()
+        if count > 0:
+            uw_counts[uw] = count
+    
+    # Sort by count
+    sorted_uws = sorted(uw_counts.items(), key=lambda x: -x[1])
+    
+    # Create dropdown options with counts
+    uw_options = ["All Underwriters"] + [f"{uw} ({count} IPOs)" for uw, count in sorted_uws]
+    uw_map = {"All Underwriters": None}
+    uw_map.update({f"{uw} ({count} IPOs)": uw for uw, count in sorted_uws})
     
     selected_uw_label = st.sidebar.selectbox(
-        "Select Underwriter",
+        "Search Underwriter (partial match)",
         options=uw_options,
-        index=0
+        index=0,
+        help="Select an underwriter - will match any IPO where this name appears"
     )
     
     selected_uw = uw_map[selected_uw_label]
+    
+    # ========================================================================
+    # TICKER SEARCH - Filter by ticker symbol
+    # ========================================================================
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔎 Ticker Search")
+    
+    # Get all tickers sorted alphabetically
+    all_tickers = sorted(df['ticker_clean'].dropna().unique().tolist())
+    ticker_options = ["All Tickers"] + all_tickers
+    
+    # Text input for quick search
+    ticker_search = st.sidebar.text_input(
+        "Search Ticker",
+        value="",
+        placeholder="Type ticker (e.g., SLGB)",
+        help="Type to filter tickers, or select from dropdown"
+    ).upper().strip()
+    
+    # Filter ticker list based on search
+    if ticker_search:
+        filtered_tickers = [t for t in all_tickers if ticker_search in t]
+        if filtered_tickers:
+            ticker_options = ["All Matching"] + filtered_tickers
+        else:
+            ticker_options = ["No matches found"]
+    
+    selected_ticker_filter = st.sidebar.selectbox(
+        "Select Ticker",
+        options=ticker_options,
+        index=0,
+        help="Filter to show only this ticker"
+    )
     
     # Filter options
     st.sidebar.markdown("---")
@@ -520,11 +1712,21 @@ def main():
     
     # Build filter mask
     mask = (
-        (df['underwriter'] == selected_uw) &
         (df['operation_risk_score'] >= min_risk) &
         (df['date'].dt.date >= date_range[0]) &
         (df['date'].dt.date <= date_range[1])
     )
+    
+    # Apply underwriter filter (partial match)
+    if selected_uw is not None:
+        mask &= df['underwriter'].str.contains(selected_uw, case=False, na=False, regex=False)
+    
+    # Apply ticker filter
+    if selected_ticker_filter not in ["All Tickers", "All Matching", "No matches found"]:
+        mask &= df['ticker_clean'] == selected_ticker_filter
+    elif ticker_search and selected_ticker_filter == "All Matching":
+        # Filter to all tickers containing the search term
+        mask &= df['ticker_clean'].str.contains(ticker_search, case=False, na=False)
     
     # Apply country filter
     if country_filter == "Tax Haven Only" and 'is_tax_haven' in df.columns:
@@ -542,8 +1744,9 @@ def main():
     
     filtered_df = df[mask].sort_values('date', ascending=False)
     
-    # Underwriter stats
-    st.header(f"📊 {selected_uw[:50]}")
+    # Header
+    header_text = f"📊 {selected_uw}" if selected_uw else "📊 All Underwriters"
+    st.header(header_text)
     
     col1, col2, col3, col4, col5 = st.columns(5)
     
@@ -731,49 +1934,301 @@ def main():
         st.plotly_chart(fig3, use_container_width=True)
     
     # ========================================================================
-    # COMPARISON VIEW
+    # DETAILED CHART HELPER FUNCTIONS
+    # ========================================================================
+    
+    def show_detailed_chart(ticker: str, ipo_date: datetime, ipo_price: float, name: str):
+        """Set session state to show detailed chart."""
+        st.session_state.detailed_ipo = {
+            'ticker': ticker,
+            'date': ipo_date,
+            'price': ipo_price,
+            'name': name
+        }
+    
+    def close_detailed_view():
+        st.session_state.detailed_ipo = None
+    
+    # Helper function for Polygon API
+    def fetch_polygon_bars_detailed(ticker: str, start: str, end: str, 
+                                     timeframe: str, multiplier: int, api_key: str) -> pd.DataFrame:
+        """Fetch detailed bars from Polygon.io API."""
+        try:
+            url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{multiplier}/{timeframe}/{start}/{end}"
+            params = {
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 50000,
+                "apiKey": api_key
+            }
+            
+            resp = requests.get(url, params=params, timeout=30)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'results' in data and data['results']:
+                    df = pd.DataFrame(data['results'])
+                    df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
+                    df = df.rename(columns={
+                        'o': 'open', 'h': 'high', 'l': 'low', 
+                        'c': 'close', 'v': 'volume'
+                    })
+                    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            else:
+                st.warning(f"Polygon API error: {resp.status_code} - {resp.text[:100]}")
+                
+        except Exception as e:
+            st.error(f"Error fetching from Polygon: {e}")
+        
+        return pd.DataFrame()
+    
+    # Detailed chart function with more features
+    def create_detailed_chart(df: pd.DataFrame, title: str, ipo_price: float) -> go.Figure:
+        """Create a detailed candlestick chart with volume and IPO price line."""
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(text="No data", x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            vertical_spacing=0.03, row_heights=[0.7, 0.3]
+        )
+        
+        # Candlestick
+        fig.add_trace(go.Candlestick(
+            x=df['timestamp'],
+            open=df['open'], high=df['high'],
+            low=df['low'], close=df['close'],
+            name='Price',
+            increasing_line_color='#26a69a',
+            decreasing_line_color='#ef5350'
+        ), row=1, col=1)
+        
+        # IPO Price line
+        fig.add_hline(
+            y=ipo_price, line_dash="dash", line_color="blue",
+            annotation_text=f"IPO ${ipo_price:.2f}",
+            row=1, col=1
+        )
+        
+        # Volume bars
+        colors = ['#26a69a' if row['close'] >= row['open'] else '#ef5350' 
+                  for _, row in df.iterrows()]
+        fig.add_trace(go.Bar(
+            x=df['timestamp'], y=df['volume'],
+            name='Volume', marker_color=colors, opacity=0.7
+        ), row=2, col=1)
+        
+        # Calculate stats for title
+        max_price = df['high'].max()
+        min_price = df['low'].min()
+        pct_from_ipo = (max_price / ipo_price - 1) * 100
+        
+        fig.update_layout(
+            title=f"{title}<br><sup>High: ${max_price:.2f} (+{pct_from_ipo:.0f}% from IPO) | Low: ${min_price:.2f}</sup>",
+            height=600,
+            showlegend=False,
+            template='plotly_white',
+            xaxis2=dict(
+                rangeslider=dict(visible=True, thickness=0.05),
+                rangeselector=dict(
+                    buttons=list([
+                        dict(count=1, label="1H", step="hour", stepmode="backward"),
+                        dict(count=1, label="1D", step="day", stepmode="backward"),
+                        dict(count=7, label="1W", step="day", stepmode="backward"),
+                        dict(count=1, label="1M", step="month", stepmode="backward"),
+                        dict(step="all", label="All")
+                    ])
+                )
+            )
+        )
+        
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig.update_yaxes(title_text="Volume", row=2, col=1)
+        
+        return fig
+    
+    # ========================================================================
+    # CHART GRID WITH CLICKABLE BUTTONS
     # ========================================================================
     st.markdown("---")
-    st.subheader("🔄 Quick Comparison - All IPOs from This Underwriter")
+    st.subheader("🔄 Chart Grid - All IPOs (Day 1 | Month | Lifetime)")
     
-    # Show mini charts for all IPOs
-    cols_per_row = 3
+    # Quick select dropdown for detailed view
+    st.markdown("##### 🔍 Quick View - Select IPO for Detailed Chart")
     
-    for i in range(0, min(len(filtered_df), 12), cols_per_row):
-        cols = st.columns(cols_per_row)
+    if len(filtered_df) > 0:
+        # Create options for dropdown
+        quick_select_options = ["-- Select an IPO --"] + [
+            f"{row['ticker_clean']} - {str(row.get('Name', ''))[:25]} | {row['date'].strftime('%Y-%m-%d')} | ${row['IPO Sh Px']:.0f}" 
+            if pd.notna(row.get('IPO Sh Px')) else 
+            f"{row['ticker_clean']} - {str(row.get('Name', ''))[:25]} | {row['date'].strftime('%Y-%m-%d')}"
+            for _, row in filtered_df.head(100).iterrows()
+        ]
         
-        for j, col in enumerate(cols):
-            idx = i + j
-            if idx >= len(filtered_df):
-                break
+        quick_col1, quick_col2 = st.columns([3, 1])
+        with quick_col1:
+            selected_quick = st.selectbox(
+                "Choose IPO to view detailed chart:",
+                options=quick_select_options,
+                index=0,
+                key="quick_select_ipo",
+                label_visibility="collapsed"
+            )
+        
+        with quick_col2:
+            if selected_quick != "-- Select an IPO --":
+                # Extract ticker from selection
+                quick_ticker = selected_quick.split(" - ")[0]
+                quick_row = filtered_df[filtered_df['ticker_clean'] == quick_ticker].iloc[0]
+                
+                if st.button("📊 Open Detailed View", key="quick_open_btn", type="primary"):
+                    show_detailed_chart(
+                        quick_ticker,
+                        quick_row['date'],
+                        quick_row['IPO Sh Px'] if pd.notna(quick_row['IPO Sh Px']) else 4.0,
+                        str(quick_row.get('Name', ''))[:40]
+                    )
+                    st.rerun()
+    
+    st.markdown("---")
+    
+    # Limit for performance
+    max_ipos = st.slider("Max IPOs to show", 5, 50, 15, help="More IPOs = slower loading")
+    
+    if len(filtered_df) == 0:
+        st.warning("No IPOs match the current filters.")
+    else:
+        st.info(f"Showing {min(len(filtered_df), max_ipos)} of {len(filtered_df)} IPOs | 💡 **Click 📊 Expand button** on any IPO to see detailed chart with live Polygon data")
+        
+        # Create a compact mini-chart function
+        def create_mini_chart(df: pd.DataFrame, title: str, height: int = 200) -> go.Figure:
+            """Create a compact line chart for grid view with visible date axis."""
+            if df.empty or len(df) < 2:
+                fig = go.Figure()
+                fig.add_annotation(text="No data", xref="paper", yref="paper",
+                                  x=0.5, y=0.5, showarrow=False, font_size=10)
+                fig.update_layout(height=height, margin=dict(l=5, r=5, t=25, b=25))
+                return fig
             
-            row = filtered_df.iloc[idx]
+            # Calculate color based on performance
+            start_price = df['close'].iloc[0]
+            end_price = df['close'].iloc[-1]
+            color = '#26a69a' if end_price >= start_price else '#ef5350'
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=df['close'],
+                mode='lines',
+                line=dict(color=color, width=1.5),
+                fill='tozeroy',
+                fillcolor=f'rgba{tuple(list(bytes.fromhex(color[1:])) + [0.1])}'
+            ))
+            
+            # Add high/low annotations
+            max_price = df['high'].max()
+            min_price = df['low'].min()
+            pct_change = (end_price / start_price - 1) * 100
+            
+            # Determine date format based on title/timeframe
+            if '1min' in title.lower() or 'minute' in title.lower():
+                tick_format = '%H:%M'
+                dtick = None  # Auto
+            elif 'month' in title.lower():
+                tick_format = '%m/%d'
+                dtick = 'D7'  # Weekly ticks
+            else:  # Lifetime
+                tick_format = '%Y-%m'
+                dtick = 'M3'  # Quarterly ticks
+            
+            fig.update_layout(
+                title=dict(text=f"{title} ({pct_change:+.0f}%)", font_size=10, x=0.5),
+                height=height,
+                margin=dict(l=40, r=10, t=30, b=40),
+                xaxis=dict(
+                    showticklabels=True, 
+                    showgrid=True,
+                    gridcolor='rgba(128,128,128,0.2)',
+                    tickformat=tick_format,
+                    tickfont=dict(size=8),
+                    tickangle=-45,
+                    nticks=5,  # Limit number of ticks
+                ),
+                yaxis=dict(
+                    showticklabels=True, 
+                    showgrid=True, 
+                    gridcolor='rgba(128,128,128,0.2)',
+                    tickfont=dict(size=8),
+                    tickprefix='$',
+                ),
+                showlegend=False,
+                template='plotly_white'
+            )
+            
+            return fig
+        
+        # Display grid - each IPO gets a row with 3 charts + detail button
+        for i, (_, row) in enumerate(filtered_df.head(max_ipos).iterrows()):
             ticker = row['ticker_clean']
             ipo_dt = row['date']
             price = row['IPO Sh Px'] if pd.notna(row['IPO Sh Px']) else 4.0
+            bounce = row['lifetime_hi_vs_ipo'] if pd.notna(row['lifetime_hi_vs_ipo']) else 0
+            name = str(row.get('Name', ''))[:40]
             
-            with col:
-                # Fetch 30-day data
-                start = ipo_dt.strftime('%Y-%m-%d')
-                end = (ipo_dt + timedelta(days=30)).strftime('%Y-%m-%d')
-                
-                bars = fetch_bars(ticker, start, end, "day", price, data_source)
-                
-                title = f"{ticker} ({ipo_dt.strftime('%Y-%m')})"
-                if pd.notna(row['lifetime_hi_vs_ipo']):
-                    title += f" | +{row['lifetime_hi_vs_ipo']:.0f}%"
-                
-                fig = create_summary_chart(bars, title)
-                st.plotly_chart(fig, use_container_width=True)
+            # Row container with border
+            with st.container():
+                # Row header with detail button
+                header_col1, header_col2, header_col3 = st.columns([4, 1, 1])
+                with header_col1:
+                    st.markdown(f"**{i+1}. {ticker}** - {name}")
+                    st.caption(f"IPO: {ipo_dt.strftime('%Y-%m-%d')} | ${price:.0f} | Bounce: {bounce:.0f}%")
+                with header_col2:
+                    if st.button("📊 Expand", key=f"detail_btn_{ticker}_{i}", 
+                                help="Click to view detailed chart with Polygon data",
+                                type="primary", use_container_width=True):
+                        show_detailed_chart(ticker, ipo_dt, price, name)
+                        st.rerun()
+                with header_col3:
+                    # Link to external chart
+                    st.link_button("📈 Yahoo", f"https://finance.yahoo.com/quote/{ticker}", 
+                                   use_container_width=True)
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                # Day 1 - 1 minute (or daily if minute not available)
+                d1_start = ipo_dt.strftime('%Y-%m-%d')
+                d1_bars = fetch_bars(ticker, d1_start, d1_start, "minute", price, data_source)
+                fig1 = create_mini_chart(d1_bars, "Day 1 (1min)")
+                st.plotly_chart(fig1, use_container_width=True, key=f"d1_{ticker}_{i}")
+            
+            with col2:
+                # First month - daily
+                m1_start = ipo_dt.strftime('%Y-%m-%d')
+                m1_end = (ipo_dt + timedelta(days=30)).strftime('%Y-%m-%d')
+                m1_bars = fetch_bars(ticker, m1_start, m1_end, "day", price, data_source)
+                fig2 = create_mini_chart(m1_bars, "Month (daily)")
+                st.plotly_chart(fig2, use_container_width=True, key=f"m1_{ticker}_{i}")
+            
+            with col3:
+                # Lifetime - daily
+                lt_start = ipo_dt.strftime('%Y-%m-%d')
+                lt_end = datetime.now().strftime('%Y-%m-%d')
+                lt_bars = fetch_bars(ticker, lt_start, lt_end, "day", price, data_source)
+                fig3 = create_mini_chart(lt_bars, "Lifetime (daily)")
+                st.plotly_chart(fig3, use_container_width=True, key=f"lt_{ticker}_{i}")
+            
+            st.markdown("---")
     
     # ========================================================================
     # FOOTER
     # ========================================================================
-    st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: gray; font-size: 12px;'>
     IPO Operation Analysis Dashboard | Data: Bloomberg EQS + Polygon<br>
-    Risk scores based on underwriter, price, float, and volume characteristics
+    Risk scores based on underwriter, price, float, country, and VC heuristics
     </div>
     """, unsafe_allow_html=True)
 
