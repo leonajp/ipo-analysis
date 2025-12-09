@@ -40,6 +40,23 @@ except ImportError:
 # ============================================================================
 CONFIG_FILE = os.path.expanduser("~/.ipo_dashboard_config.json")
 
+# ============================================================================
+# OPERATION UNDERWRITERS & LEGIT UNDERWRITERS (for risk scoring)
+# ============================================================================
+OPERATION_UNDERWRITERS = {
+    'D BORAL', 'KINGSWOOD', 'US TIGER', 'PRIME NUMBER', 'NETWORK 1',
+    'EF HUTTON', 'BANCROFT', 'CATHAY', 'RVRS', 'VIEWTRADE',
+    'JOSEPH STONE', 'BOUSTEAD', 'MAXIM', 'DAWSON', 'REVERE',
+    'DOMINARI', 'CRAFT CAPITAL', 'THINKEQUITY', 'AEGIS', 'EDDID',
+    'SPARTAN', 'AC SUNSHINE', 'WTF SECURITIES'  # WTF's underwriters pattern
+}
+
+LEGIT_UNDERWRITERS = {
+    'GOLDMAN', 'MORGAN STANLEY', 'JPMORGAN', 'JP MORGAN', 'CITI',
+    'BOFA', 'JEFFERIES', 'CREDIT SUISSE', 'UBS', 'BARCLAYS', 'DEUTSCHE',
+    'WELLS FARGO', 'RBC', 'PIPER', 'STIFEL', 'WILLIAM BLAIR'
+}
+
 def load_config() -> dict:
     """Load saved configuration including API keys (local file)."""
     try:
@@ -223,35 +240,96 @@ apply_custom_css()
 @st.cache_data
 def load_ipo_data():
     """Load the IPO analysis data (fully split-adjusted)."""
-    # Paths to check - update these for your setup
+    # Paths to check - prioritize eqsipo_final.csv (most complete)
     possible_paths = [
-        'small_ipo_fully_adjusted.csv',  # Same folder as dashboard
+        # Priority 1: eqsipo files (most complete with WTF etc.)
+        r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\eqsipo_final.csv',
+        r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\eqsipo_complete.csv',
+        'eqsipo_final.csv',
+        'eqsipo_complete.csv',
+        # Priority 2: adjusted files
+        'small_ipo_fully_adjusted.csv',
         'data/small_ipo_fully_adjusted.csv',
         r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\small_ipo_fully_adjusted.csv',
         r'P:\Hamren\Other\small_ipo_fully_adjusted.csv',
+        # Priority 3: unadjusted
+        'eqsipo_unadj.csv',
     ]
     
     for path in possible_paths:
         if os.path.exists(path):
             df = pd.read_csv(path)
-            df['date'] = pd.to_datetime(df['date'])
-            df['ticker_clean'] = df['Ticker'].str.replace(' US Equity', '')
+            
+            # Handle different date column names
+            if 'date' not in df.columns and 'IPO Dt' in df.columns:
+                df['date'] = pd.to_datetime(df['IPO Dt'], errors='coerce')
+            elif 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            
+            # Clean ticker - handle both "WTF US Equity" and "WTF" formats
+            if 'ticker_clean' not in df.columns:
+                if 'Ticker' in df.columns:
+                    df['ticker_clean'] = df['Ticker'].astype(str).str.replace(' US Equity', '', regex=False).str.strip()
+                elif 'ticker' in df.columns:
+                    df['ticker_clean'] = df['ticker'].astype(str).str.replace(' US Equity', '', regex=False).str.strip()
+                else:
+                    df['ticker_clean'] = ''
+            
+            # Ensure underwriter column exists
+            if 'underwriter' not in df.columns:
+                if 'IPO Lead' in df.columns:
+                    df['underwriter'] = df['IPO Lead'].fillna('')
+                else:
+                    df['underwriter'] = ''
+            
+            # Patch known missing underwriter data
+            KNOWN_UNDERWRITERS = {
+                'WTF': 'CATHAY SECURITIES,DOMINARI',
+                'WATO': 'CATHAY SECURITIES',
+            }
+            for ticker, uw in KNOWN_UNDERWRITERS.items():
+                mask = df['ticker_clean'] == ticker
+                if mask.any():
+                    # Only patch if underwriter is empty/NaN
+                    empty_mask = mask & (df['underwriter'].isna() | (df['underwriter'] == ''))
+                    df.loc[empty_mask, 'underwriter'] = uw
             
             # Add risk score if missing
             if 'operation_risk_score' not in df.columns:
                 df['operation_risk_score'] = 0
-                df.loc[df['IPO Sh Px'] <= 5, 'operation_risk_score'] += 15
-                df.loc[df['IPO Sh Offered'] <= 1_500_000, 'operation_risk_score'] += 15
+                if 'IPO Sh Px' in df.columns:
+                    df.loc[df['IPO Sh Px'] <= 5, 'operation_risk_score'] += 15
+                if 'IPO Sh Offered' in df.columns:
+                    df.loc[df['IPO Sh Offered'] <= 1_500_000, 'operation_risk_score'] += 15
+                
+                # Add operation underwriter risk
+                if 'underwriter' in df.columns:
+                    for op_uw in OPERATION_UNDERWRITERS:
+                        mask = df['underwriter'].str.contains(op_uw, case=False, na=False)
+                        df.loc[mask, 'operation_risk_score'] += 10
             
-            st.sidebar.success(f"Loaded: {os.path.basename(path)}")
+            # Add lifetime_hi_vs_ipo if missing
+            if 'lifetime_hi_vs_ipo' not in df.columns:
+                if 'Lifetime High' in df.columns and 'IPO Sh Px' in df.columns:
+                    df['lifetime_hi_vs_ipo'] = ((df['Lifetime High'] / df['IPO Sh Px']) - 1) * 100
+                else:
+                    df['lifetime_hi_vs_ipo'] = 0
+            
+            st.sidebar.success(f"✅ Loaded: {os.path.basename(path)} ({len(df)} IPOs)")
+            
+            # Show if WTF is in data (for debugging)
+            if 'WTF' in df['ticker_clean'].values:
+                st.sidebar.info("📌 WTF ticker found in data")
+            
             return df
     
     st.error("""
-    Could not find small_ipo_fully_adjusted.csv
+    Could not find IPO data file.
     
-    Please either:
-    1. Run ipo_full_adjustment.py first to generate the file
-    2. Place small_ipo_fully_adjusted.csv in the same folder as this dashboard
+    Please place one of these files in the same folder as this dashboard:
+    - small_ipo_fully_adjusted.csv
+    - eqsipo_complete.csv
+    - eqsipo_final.csv
     """)
     return pd.DataFrame()
 
@@ -1650,21 +1728,26 @@ def analysis_page():
     all_tickers = sorted(df['ticker_clean'].dropna().unique().tolist())
     ticker_options = ["All Tickers"] + all_tickers
     
+    # Show total count
+    st.sidebar.caption(f"Total tickers in data: {len(all_tickers)}")
+    
     # Text input for quick search
     ticker_search = st.sidebar.text_input(
         "Search Ticker",
         value="",
-        placeholder="Type ticker (e.g., SLGB)",
+        placeholder="Type ticker (e.g., WTF, SLGB)",
         help="Type to filter tickers, or select from dropdown"
     ).upper().strip()
     
     # Filter ticker list based on search
     if ticker_search:
-        filtered_tickers = [t for t in all_tickers if ticker_search in t]
+        filtered_tickers = [t for t in all_tickers if ticker_search in t.upper()]
         if filtered_tickers:
             ticker_options = ["All Matching"] + filtered_tickers
+            st.sidebar.success(f"Found {len(filtered_tickers)} match(es)")
         else:
             ticker_options = ["No matches found"]
+            st.sidebar.warning(f"'{ticker_search}' not found in {len(all_tickers)} tickers")
     
     selected_ticker_filter = st.sidebar.selectbox(
         "Select Ticker",
