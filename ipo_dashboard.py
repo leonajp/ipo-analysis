@@ -1886,7 +1886,7 @@ def analysis_page():
     st.subheader("📋 IPO List")
     
     # Build display columns dynamically based on what's available
-    base_cols = ['ticker_clean', 'Name', 'date', 'IPO Sh Px', 
+    base_cols = ['ticker_clean', 'Name', 'date', 'IPO Sh Px', 'underwriter',
                  'operation_risk_score', 'lifetime_hi_vs_ipo', 'ret_d1']
     
     heuristic_cols = []
@@ -1908,6 +1908,7 @@ def analysis_page():
         'Name': 'Name', 
         'date': 'IPO Date',
         'IPO Sh Px': 'Price',
+        'underwriter': 'Underwriter',
         'operation_risk_score': 'Risk',
         'lifetime_hi_vs_ipo': 'Bounce %',
         'ret_d1': 'D1 %',
@@ -1932,6 +1933,8 @@ def analysis_page():
         display_df['💰'] = display_df['💰'].apply(lambda x: "✓" if x else "")
     if 'Name' in display_df.columns:
         display_df['Name'] = display_df['Name'].apply(lambda x: str(x)[:25] if pd.notna(x) else "")
+    if 'Underwriter' in display_df.columns:
+        display_df['Underwriter'] = display_df['Underwriter'].apply(lambda x: str(x)[:20] if pd.notna(x) and str(x).strip() else "Unknown")
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
     
@@ -1961,10 +1964,35 @@ def analysis_page():
     tax_status = "🏝️ Tax Haven" if ipo_info.get('is_tax_haven', False) else ""
     country = ipo_info.get('Cntry Terrtry Of Inc', 'N/A')
     
+    # Get underwriter
+    underwriter = ipo_info.get('underwriter', '')
+    if pd.isna(underwriter) or str(underwriter).strip() == '':
+        underwriter = ipo_info.get('IPO Lead', 'Unknown')
+    if pd.isna(underwriter) or str(underwriter).strip() == '':
+        underwriter = 'Unknown'
+    
+    # Check if operation underwriter
+    uw_upper = str(underwriter).upper()
+    is_operation_uw = any(op in uw_upper for op in ['CATHAY', 'D BORAL', 'KINGSWOOD', 'US TIGER', 'PRIME NUMBER', 
+                                                      'NETWORK 1', 'EF HUTTON', 'BANCROFT', 'RVRS', 'VIEWTRADE',
+                                                      'JOSEPH STONE', 'BOUSTEAD', 'MAXIM', 'DAWSON', 'REVERE',
+                                                      'DOMINARI', 'CRAFT CAPITAL', 'THINKEQUITY', 'AEGIS'])
+    is_legit_uw = any(leg in uw_upper for leg in ['GOLDMAN', 'MORGAN STANLEY', 'JPMORGAN', 'JP MORGAN', 'CITI',
+                                                    'BOFA', 'JEFFERIES', 'CREDIT SUISSE', 'UBS', 'BARCLAYS'])
+    
+    # Format underwriter with color
+    if is_operation_uw:
+        uw_display = f"⚠️ **{underwriter}** (Operation UW)"
+    elif is_legit_uw:
+        uw_display = f"✅ **{underwriter}** (Legit)"
+    else:
+        uw_display = f"**{underwriter}**"
+    
     st.markdown(f"""
     **{selected_ticker}** - {str(ipo_info['Name'])[:50]}
     - 📅 IPO Date: {ipo_date.strftime('%Y-%m-%d')}
     - 💵 IPO Price: ${ipo_price:.2f}
+    - 🏦 Underwriter: {uw_display}
     - ⚠️ Risk Score: **{ipo_info['operation_risk_score']:.0f}**
     - 📈 Lifetime High: **{ipo_info['lifetime_hi_vs_ipo']:.0f}%**
     - 🌍 Country: {country} {tax_status}
