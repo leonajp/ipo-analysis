@@ -9,13 +9,17 @@ Features:
 - Daily chart (First Month)
 - Daily chart (First Year)
 - Grid view of all IPO charts
+- Direct ClickHouse database connection
 
 Requirements:
-    pip install streamlit pandas plotly requests polygon-api-client
+    pip install streamlit pandas plotly requests polygon-api-client clickhouse-connect
 
 Usage:
     streamlit run ipo_dashboard.py
 """
+
+# VERSION - Update when making changes to verify user has latest code
+DASHBOARD_VERSION = "2.1.4-afterhours"
 
 import streamlit as st
 import pandas as pd
@@ -35,10 +39,28 @@ try:
 except ImportError:
     HAS_SCRAPING = False
 
+# Optional imports for ClickHouse
+try:
+    import clickhouse_connect
+    HAS_CLICKHOUSE = True
+except ImportError:
+    HAS_CLICKHOUSE = False
+
 # ============================================================================
 # CONFIG / API KEY PERSISTENCE
 # ============================================================================
 CONFIG_FILE = os.path.expanduser("~/.ipo_dashboard_config.json")
+
+# ClickHouse Configuration (can be overridden by environment variables or config file)
+CLICKHOUSE_CONFIG = {
+    'host': os.environ.get('CLICKHOUSE_HOST', 'i35q8zrtq4.us-east-2.aws.clickhouse.cloud'),
+    'port': int(os.environ.get('CLICKHOUSE_PORT', '443')),
+    'user': os.environ.get('CLICKHOUSE_USER', 'default'),
+    'password': os.environ.get('CLICKHOUSE_PASSWORD', ''),
+    'database': os.environ.get('CLICKHOUSE_DATABASE', 'ipo'),
+    'table': os.environ.get('CLICKHOUSE_TABLE', 'ipo_master'),
+    'secure': True,
+}
 
 # ============================================================================
 # OPERATION UNDERWRITERS & LEGIT UNDERWRITERS (for risk scoring)
@@ -237,10 +259,241 @@ apply_custom_css()
 # ============================================================================
 # DATA LOADING
 # ============================================================================
-@st.cache_data
-def load_ipo_data():
-    """Load the IPO analysis data (fully split-adjusted)."""
-    # Paths to check - prioritize eqsipo_final.csv (most complete)
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def load_from_clickhouse(password: str = None) -> pd.DataFrame:
+    """Load IPO data directly from ClickHouse Cloud."""
+    if not HAS_CLICKHOUSE:
+        return None
+    
+    # Get password from parameter, env var, or config
+    ch_password = password or CLICKHOUSE_CONFIG['password']
+    if not ch_password:
+        config = load_config()
+        ch_password = config.get('clickhouse_password', '')
+    
+    if not ch_password:
+        return None
+    
+    try:
+        client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_CONFIG['host'],
+            port=CLICKHOUSE_CONFIG['port'],
+            user=CLICKHOUSE_CONFIG['user'],
+            password=ch_password,
+            secure=CLICKHOUSE_CONFIG['secure'],
+        )
+        
+        # First, check what columns exist in the table
+        try:
+            cols_result = client.query(f"DESCRIBE {CLICKHOUSE_CONFIG['database']}.{CLICKHOUSE_CONFIG['table']}")
+            existing_cols = {row[0] for row in cols_result.result_rows}
+        except:
+            existing_cols = set()
+        
+        # Define desired columns with fallbacks
+        desired_cols = [
+            'polygon_ticker', 'ticker', 'ticker_bbg', 'Name',
+            'ipo_date', 'ipo_price', 'ipo_shares_offered', 'offer_size_m',
+            'exchange', 'country', 'underwriter',
+            'all_underwriters', 'underwriter_tier',
+            'is_operation_uw', 'operation_risk_score', 'is_tax_haven', 'vc_backed',
+            'top_shareholders', 'vc_investors',
+            'vc_ownership_pct', 'founder_ownership_pct', 'institutional_ownership_pct',
+            'd1_open', 'd1_high', 'd1_low', 'd1_close', 'd1_volume', 'd1_open_adj',
+            'd2_open', 'd2_high', 'd2_low', 'd2_close', 'd2_volume',
+            'd3_open', 'd3_high', 'd3_low', 'd3_close', 'd3_volume',
+            'd4_open', 'd4_high', 'd4_low', 'd4_close', 'd4_volume',
+            'd5_open', 'd5_high', 'd5_low', 'd5_close', 'd5_volume',
+            'ret_d1', 'ret_d5', 'ret_d30', 'lifetime_high', 'lifetime_high_unadj', 'lifetime_hi_vs_ipo',
+            'open_px', 'first_5m_high', 'first_5m_low',
+            'halted_d1', 'num_halts',
+            'sec_filing_type', 'sec_filing_date',
+            'updated_at'
+        ]
+        
+        # Only query columns that exist
+        if existing_cols:
+            query_cols = [c for c in desired_cols if c in existing_cols]
+        else:
+            query_cols = desired_cols  # Try all if we couldn't get column list
+        
+        query = f"""
+        SELECT {', '.join(query_cols)}
+        FROM {CLICKHOUSE_CONFIG['database']}.{CLICKHOUSE_CONFIG['table']}
+        ORDER BY ipo_date DESC
+        """
+        
+        result = client.query(query)
+        df = pd.DataFrame(result.result_rows, columns=result.column_names)
+        
+        return df
+        
+    except Exception as e:
+        st.sidebar.warning(f"ClickHouse error: {str(e)[:50]}...")
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner="Loading IPO data...")
+def load_ipo_data(use_clickhouse: bool = True, ch_password: str = None, _cache_key: str = None):
+    """Load the IPO analysis data (from ClickHouse or CSV fallback).
+    
+    Note: _cache_key is used to force cache refresh when data source changes.
+    """
+    
+    # Try ClickHouse first if enabled
+    if use_clickhouse and HAS_CLICKHOUSE:
+        df = load_from_clickhouse(ch_password)
+        if df is not None and len(df) > 0:
+            # Map ClickHouse columns to expected dashboard columns
+            df['date'] = pd.to_datetime(df['ipo_date'], errors='coerce')
+            df['ticker_clean'] = df['polygon_ticker'].fillna(df['ticker']).fillna('')
+            df['Ticker'] = df['ticker_bbg'].fillna(df['ticker_clean'] + ' US Equity')
+            df['IPO Sh Px'] = df['ipo_price']
+            df['IPO Sh Offered'] = df['ipo_shares_offered']
+            df['OfferSizeM'] = df['offer_size_m']
+            df['Prim Exch Nm'] = df['exchange']
+            df['Cntry Terrtry Of Inc'] = df['country']
+            df['IPO Lead'] = df['underwriter']
+            df['Lifetime High'] = df['lifetime_high']
+            
+            # Convert numeric columns
+            df['d1_open'] = pd.to_numeric(df.get('d1_open', 0), errors='coerce').fillna(0)
+            df['d1_close'] = pd.to_numeric(df.get('d1_close', 0), errors='coerce').fillna(0)
+            df['ipo_price'] = pd.to_numeric(df['ipo_price'], errors='coerce').fillna(0)
+            df['lifetime_high'] = pd.to_numeric(df['lifetime_high'], errors='coerce').fillna(0)
+            
+            # Calculate ratios for data quality checks
+            df['d1_to_ipo_ratio'] = np.where(
+                (df['ipo_price'] > 0) & (df['d1_open'] > 0),
+                df['d1_open'] / df['ipo_price'],
+                1.0
+            )
+            df['lt_to_ipo_ratio'] = np.where(
+                df['ipo_price'] > 0,
+                df['lifetime_high'] / df['ipo_price'],
+                0
+            )
+            
+            # Flag potentially bad data for review
+            df['price_adjusted'] = (df['d1_to_ipo_ratio'] > 2.0) | (df['d1_to_ipo_ratio'] < 0.5)
+            
+            # === BOUNCE CALCULATIONS (two methods) ===
+            # Method 1: vs D1 Open (adjusted) - day trading perspective
+            # Method 2: vs IPO Price - investment perspective
+            
+            # Both will be calculated and user can toggle between them
+            
+            # BOUNCE vs D1 Open (adjusted)
+            db_bounce_col = 'lifetime_hi_vs_ipo'
+            if db_bounce_col in df.columns and df[db_bounce_col].notna().any() and (df[db_bounce_col] != 0).any():
+                df['bounce_vs_d1open'] = pd.to_numeric(df[db_bounce_col], errors='coerce').fillna(0)
+                df['bounce_vs_d1open'] = np.clip(df['bounce_vs_d1open'].values, -100, 5000)
+            elif 'd1_open_adj' in df.columns:
+                d1_open_adj = pd.to_numeric(df['d1_open_adj'], errors='coerce').fillna(0)
+                df['bounce_vs_d1open'] = np.where(
+                    (d1_open_adj > 0) & (df['lifetime_high'] > 0),
+                    ((df['lifetime_high'] / d1_open_adj) - 1) * 100,
+                    0
+                )
+                df['bounce_vs_d1open'] = np.clip(df['bounce_vs_d1open'].values, -100, 5000)
+            elif 'd1_open' in df.columns:
+                df['bounce_vs_d1open'] = np.where(
+                    (df['d1_open'] > 0) & (df['lifetime_high'] > 0),
+                    ((df['lifetime_high'] / df['d1_open']) - 1) * 100,
+                    0
+                )
+                df['bounce_vs_d1open'] = np.clip(df['bounce_vs_d1open'].values, -100, 1000)
+            else:
+                df['bounce_vs_d1open'] = 0
+            
+            # BOUNCE vs IPO Price
+            df['bounce_vs_ipo'] = np.where(
+                (df['ipo_price'] > 0) & (df['lifetime_high'] > 0),
+                ((df['lifetime_high'] / df['ipo_price']) - 1) * 100,
+                0
+            )
+            df['bounce_vs_ipo'] = np.clip(df['bounce_vs_ipo'].values, -100, 10000)
+            
+            # Legacy column - default to bounce_vs_d1open
+            df['lifetime_hi_vs_ipo'] = df['bounce_vs_d1open']
+            
+            # ============================================================
+            # FINAL UNCONDITIONAL CAP - catches ANY edge cases
+            # ============================================================
+            df['bounce_vs_d1open'] = pd.to_numeric(df['bounce_vs_d1open'], errors='coerce').fillna(0)
+            df['bounce_vs_ipo'] = pd.to_numeric(df['bounce_vs_ipo'], errors='coerce').fillna(0)
+            df['lifetime_hi_vs_ipo'] = pd.to_numeric(df['lifetime_hi_vs_ipo'], errors='coerce').fillna(0)
+            
+            # Debug: Check for astronomical values BEFORE cap
+            astronomical_mask = df['bounce_vs_d1open'] > 10000
+            if astronomical_mask.any():
+                bad_tickers = df.loc[astronomical_mask, 'polygon_ticker'].tolist()[:5]
+                st.sidebar.warning(f"⚠️ Found {astronomical_mask.sum()} astronomical bounce values (>{10000}%): {bad_tickers}")
+            
+            # Apply the cap to all bounce columns
+            df['bounce_vs_d1open'] = np.clip(df['bounce_vs_d1open'].values, -100, 10000)
+            df['bounce_vs_ipo'] = np.clip(df['bounce_vs_ipo'].values, -100, 10000)
+            df['lifetime_hi_vs_ipo'] = np.clip(df['lifetime_hi_vs_ipo'].values, -100, 10000)
+            
+            # Also filter out IPOs with suspiciously low prices (likely bad data)
+            bad_data_mask = (df['ipo_price'] < 0.50) & (df['bounce_vs_d1open'] > 1000)
+            n_bad = bad_data_mask.sum()
+            if n_bad > 0:
+                st.sidebar.info(f"ℹ️ Set bounce=0 for {n_bad} low-price IPOs")
+            df.loc[bad_data_mask, 'bounce_vs_d1open'] = 0
+            df.loc[bad_data_mask, 'bounce_vs_ipo'] = 0
+            df.loc[bad_data_mask, 'lifetime_hi_vs_ipo'] = 0
+            
+            # Add missing columns with defaults if they don't exist
+            if 'is_tax_haven' not in df.columns:
+                # Detect tax haven countries
+                TAX_HAVEN_COUNTRIES = ['CAYMAN ISLANDS', 'BRITISH VIRGIN ISLANDS', 'BERMUDA', 
+                                       'MARSHALL ISLANDS', 'CYPRUS', 'JERSEY', 'GUERNSEY',
+                                       'ISLE OF MAN', 'BAHAMAS', 'LUXEMBOURG', 'MALTA',
+                                       'VIRGIN ISLANDS', 'BVI', 'PANAMA', 'SEYCHELLES']
+                if 'country' in df.columns:
+                    df['is_tax_haven'] = df['country'].str.upper().isin(TAX_HAVEN_COUNTRIES).astype(int)
+                else:
+                    df['is_tax_haven'] = 0
+            
+            if 'is_us' not in df.columns:
+                if 'country' in df.columns:
+                    df['is_us'] = df['country'].str.upper().isin(['US', 'USA', 'UNITED STATES', 'U.S.']).astype(int)
+                else:
+                    df['is_us'] = 0
+            
+            if 'operation_risk_score' not in df.columns:
+                df['operation_risk_score'] = 0
+                # Add basic risk factors
+                if 'ipo_price' in df.columns:
+                    df.loc[df['ipo_price'] <= 5, 'operation_risk_score'] += 15
+                if 'ipo_shares_offered' in df.columns:
+                    df.loc[df['ipo_shares_offered'] <= 1_500_000, 'operation_risk_score'] += 15
+                if 'is_tax_haven' in df.columns:
+                    df.loc[df['is_tax_haven'] == 1, 'operation_risk_score'] += 10
+                if 'is_operation_uw' in df.columns:
+                    df.loc[df['is_operation_uw'] == 1, 'operation_risk_score'] += 15
+            
+            # Count underwriter coverage
+            has_uw = df['underwriter'].notna() & (df['underwriter'] != '')
+            uw_count = has_uw.sum()
+            uw_pct = uw_count / len(df) * 100 if len(df) > 0 else 0
+            
+            # Diagnostic: Show bounce data source
+            bounce_source = "unknown"
+            if 'lifetime_hi_vs_ipo' in df.columns and (df['lifetime_hi_vs_ipo'] != 0).any():
+                bounce_source = "DB (pre-calculated)"
+            elif 'd1_open_adj' in df.columns and (df['d1_open_adj'] > 0).any():
+                bounce_source = "Calculated (LT_High_Adj / D1_Open_Adj)"
+            else:
+                bounce_source = "⚠️ Fallback (may need fix_bounce_source.py)"
+            
+            st.sidebar.success(f"✅ ClickHouse: {len(df):,} IPOs")
+            st.sidebar.caption(f"📊 Underwriters: {uw_count:,} ({uw_pct:.0f}%)")
+            st.sidebar.caption(f"📈 Bounce source: {bounce_source}")
+            return df
+    
+    # Fallback to CSV files
     possible_paths = [
         # Priority 1: eqsipo files (most complete with WTF etc.)
         r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\eqsipo_final.csv',
@@ -308,18 +561,100 @@ def load_ipo_data():
                         mask = df['underwriter'].str.contains(op_uw, case=False, na=False)
                         df.loc[mask, 'operation_risk_score'] += 10
             
-            # Add lifetime_hi_vs_ipo if missing
-            if 'lifetime_hi_vs_ipo' not in df.columns:
-                if 'Lifetime High' in df.columns and 'IPO Sh Px' in df.columns:
-                    df['lifetime_hi_vs_ipo'] = ((df['Lifetime High'] / df['IPO Sh Px']) - 1) * 100
+            # Always recalculate/validate lifetime_hi_vs_ipo with improved split adjustment
+            if 'Lifetime High' in df.columns and 'IPO Sh Px' in df.columns:
+                # Convert to numeric
+                df['IPO Sh Px'] = pd.to_numeric(df['IPO Sh Px'], errors='coerce').fillna(0)
+                df['Lifetime High'] = pd.to_numeric(df['Lifetime High'], errors='coerce').fillna(0)
+                
+                # Check for d1_open and d1_close columns
+                d1_open_col = None
+                d1_close_col = None
+                for col in ['d1_open', 'D1 Open', 'open_px', 'Open']:
+                    if col in df.columns:
+                        d1_open_col = col
+                        break
+                for col in ['d1_close', 'D1 Close', 'close_px', 'Close']:
+                    if col in df.columns:
+                        d1_close_col = col
+                        break
+                
+                if d1_open_col:
+                    df['d1_open_price'] = pd.to_numeric(df[d1_open_col], errors='coerce').fillna(0)
                 else:
-                    df['lifetime_hi_vs_ipo'] = 0
+                    df['d1_open_price'] = 0
+                    
+                if d1_close_col:
+                    df['d1_close_price'] = pd.to_numeric(df[d1_close_col], errors='coerce').fillna(0)
+                else:
+                    df['d1_close_price'] = 0
+                
+                # Calculate ratios
+                df['d1_to_ipo_ratio'] = np.where(
+                    (df['IPO Sh Px'] > 0) & (df['d1_open_price'] > 0),
+                    df['d1_open_price'] / df['IPO Sh Px'],
+                    1.0
+                )
+                df['lt_to_ipo_ratio'] = np.where(
+                    df['IPO Sh Px'] > 0,
+                    df['Lifetime High'] / df['IPO Sh Px'],
+                    0
+                )
+                
+                # Determine reference price based on scenario
+                df['reference_price'] = np.where(
+                    # Scenario 1: D1 open differs > 2x from IPO price
+                    (df['d1_open_price'] > 0.10) & ((df['d1_to_ipo_ratio'] > 2.0) | (df['d1_to_ipo_ratio'] < 0.5)),
+                    df['d1_open_price'],
+                    np.where(
+                        # Scenario 2: Both prices similar but lifetime_high >> both (50x+)
+                        (df['d1_to_ipo_ratio'] >= 0.5) & (df['d1_to_ipo_ratio'] <= 2.0) & (df['lt_to_ipo_ratio'] > 50),
+                        np.where(df['d1_close_price'] > 0.10, df['d1_close_price'], df['d1_open_price']),
+                        # Scenario 3: Normal - use IPO price or D1 open
+                        np.where(df['IPO Sh Px'] >= 0.50, df['IPO Sh Px'], df['d1_open_price'])
+                    )
+                )
+                
+                # Calculate bounce using reference price
+                df['lifetime_hi_vs_ipo'] = np.where(
+                    (df['reference_price'] >= 0.10) & (df['Lifetime High'] > 0),
+                    ((df['Lifetime High'] / df['reference_price']) - 1) * 100,
+                    0
+                )
+                
+                # Cap based on scenario - aggressive cap for suspected unadjusted data
+                df['lifetime_hi_vs_ipo'] = np.where(
+                    (df['d1_to_ipo_ratio'] >= 0.5) & (df['d1_to_ipo_ratio'] <= 2.0) & (df['lt_to_ipo_ratio'] > 50),
+                    np.clip(df['lifetime_hi_vs_ipo'].values, -100, 1000),  # Aggressive cap
+                    np.clip(df['lifetime_hi_vs_ipo'].values, -100, 5000)   # Normal cap
+                )
+                
+                # ============================================================
+                # FINAL UNCONDITIONAL CAP - catches ANY edge cases
+                # ============================================================
+                df['lifetime_hi_vs_ipo'] = np.clip(df['lifetime_hi_vs_ipo'].values, -100, 10000)
+                
+                # Filter out bad data: IPO price < $0.50 AND bounce > 1000%
+                bad_data_mask = (df['IPO Sh Px'] < 0.50) & (df['lifetime_hi_vs_ipo'] > 1000)
+                df.loc[bad_data_mask, 'lifetime_hi_vs_ipo'] = 0
+                
+            elif 'lifetime_hi_vs_ipo' in df.columns:
+                # If column exists but source columns don't, just cap existing values
+                df['lifetime_hi_vs_ipo'] = pd.to_numeric(df['lifetime_hi_vs_ipo'], errors='coerce').fillna(0)
+                df['lifetime_hi_vs_ipo'] = np.clip(df['lifetime_hi_vs_ipo'].values, -100, 10000)
+            else:
+                df['lifetime_hi_vs_ipo'] = 0
             
-            st.sidebar.success(f"✅ Loaded: {os.path.basename(path)} ({len(df)} IPOs)")
-            
-            # Show if WTF is in data (for debugging)
-            if 'WTF' in df['ticker_clean'].values:
-                st.sidebar.info("📌 WTF ticker found in data")
+            # Count underwriter coverage
+            uw_col = 'underwriter' if 'underwriter' in df.columns else 'IPO Lead' if 'IPO Lead' in df.columns else None
+            if uw_col:
+                has_uw = df[uw_col].notna() & (df[uw_col] != '') & (df[uw_col] != 'Unknown')
+                uw_count = has_uw.sum()
+                uw_pct = uw_count / len(df) * 100 if len(df) > 0 else 0
+                st.sidebar.success(f"✅ CSV: {len(df):,} IPOs")
+                st.sidebar.caption(f"📊 Underwriters: {uw_count:,} ({uw_pct:.0f}%)")
+            else:
+                st.sidebar.success(f"✅ CSV: {len(df):,} IPOs")
             
             return df
     
@@ -371,8 +706,11 @@ def fetch_polygon_bars(ticker: str, start_date: str, end_date: str,
             to=end_date,
             limit=50000
         ):
+            # Convert UTC to EST
+            ts = pd.to_datetime(bar.timestamp, unit='ms', utc=True)
+            ts_est = ts.tz_convert('America/New_York').tz_localize(None)
             bars.append({
-                'timestamp': pd.to_datetime(bar.timestamp, unit='ms'),
+                'timestamp': ts_est,
                 'open': bar.open,
                 'high': bar.high,
                 'low': bar.low,
@@ -381,7 +719,16 @@ def fetch_polygon_bars(ticker: str, start_date: str, end_date: str,
             })
         
         if bars:
-            return pd.DataFrame(bars)
+            df = pd.DataFrame(bars)
+            # Filter to regular trading hours only (9:30 AM - 4:00 PM EST) for minute data
+            if timeframe == "minute" and len(df) > 0:
+                df['hour'] = df['timestamp'].dt.hour
+                df['minute'] = df['timestamp'].dt.minute
+                df['time_decimal'] = df['hour'] + df['minute'] / 60
+                # 9:30 AM = 9.5, 8:00 PM = 20.0 (includes after-hours)
+                df = df[(df['time_decimal'] >= 9.5) & (df['time_decimal'] <= 20.0)]
+                df = df.drop(columns=['hour', 'minute', 'time_decimal'])
+            return df
         return pd.DataFrame()
         
     except Exception as e:
@@ -446,7 +793,7 @@ def generate_sample_bars(ticker: str, start_date: str, end_date: str,
     if timeframe == "minute":
         # Generate minute bars for one trading day (9:30 AM - 4:00 PM)
         times = pd.date_range(start=start.replace(hour=9, minute=30),
-                              end=start.replace(hour=16, minute=0),
+                              end=start.replace(hour=20, minute=0),
                               freq='1min')
     else:
         # Generate daily bars
@@ -564,6 +911,14 @@ def create_candlestick_chart(df: pd.DataFrame, title: str, height: int = 400) ->
     first_price = df['open'].iloc[0]
     pct_change = (last_price / first_price - 1) * 100
     
+    # Set x-axis range for minute data (9:30 AM - 4:00 PM)
+    x_range = None
+    if ('minute' in title.lower() or '1-min' in title.lower()) and len(df) > 0:
+        chart_date = df['timestamp'].iloc[0].date()
+        x_start = pd.Timestamp(chart_date).replace(hour=9, minute=30)
+        x_end = pd.Timestamp(chart_date).replace(hour=20, minute=0)
+        x_range = [x_start, x_end]
+    
     fig.update_layout(
         title=dict(
             text=f"{title}<br><sup>High: ${max_price:.2f} | Low: ${min_price:.2f} | Change: {pct_change:+.1f}%</sup>",
@@ -580,6 +935,7 @@ def create_candlestick_chart(df: pd.DataFrame, title: str, height: int = 400) ->
             rangeslider=dict(visible=False),  # Disable on price chart (use bottom one)
             type='date',
             tickformat='%Y-%m-%d %H:%M' if 'minute' in title.lower() or '1-min' in title.lower() else '%Y-%m-%d',
+            range=x_range,
         ),
         xaxis2=dict(
             rangeslider=dict(visible=True, thickness=0.05),  # Scrollable range slider
@@ -676,8 +1032,11 @@ def statistics_page():
     """Statistical analysis page with correlation, regression, and predictions."""
     st.header("📈 Statistics & Prediction")
     
-    # Load data
-    df = load_ipo_data()
+    # Load data (use session state for ClickHouse settings if available)
+    use_ch = st.session_state.get('use_clickhouse', False)
+    ch_pw = st.session_state.get('ch_password', None)
+    cache_key = f"ch_{use_ch}_{bool(ch_pw)}"
+    df = load_ipo_data(use_clickhouse=use_ch, ch_password=ch_pw, _cache_key=cache_key)
     if df.empty:
         st.warning("No data loaded")
         return
@@ -1353,11 +1712,298 @@ def analysis_page():
     """Main analysis page with underwriter filtering and charts."""
     st.markdown("*Explore small IPOs by underwriter with multi-timeframe charts*")
     
+    # Data source for chart bars (Polygon for real-time data)
+    data_source = "polygon"
+    
     # Initialize session state
     if 'detailed_ipo' not in st.session_state:
         st.session_state.detailed_ipo = None
     if 'polygon_api_key' not in st.session_state:
         st.session_state.polygon_api_key = get_polygon_api_key()
+    
+    # ========================================================================
+    # SIDEBAR - Define before data loading (Streamlit renders in order)
+    # ========================================================================
+    st.sidebar.header("🔍 Filters")
+    st.sidebar.caption(f"v{DASHBOARD_VERSION}")
+    
+    # ========================================================================
+    # DATA SOURCE - ClickHouse or CSV fallback
+    # ========================================================================
+    st.sidebar.subheader("🗄️ Data Source")
+    
+    use_clickhouse = False
+    ch_password = None
+    
+    if not HAS_CLICKHOUSE:
+        st.sidebar.warning("Install: `pip install clickhouse-connect`")
+        st.sidebar.caption("📁 Using CSV fallback")
+    else:
+        config = load_config()
+        saved_ch_password = config.get('clickhouse_password', '') or os.environ.get('CLICKHOUSE_PASSWORD', '')
+        
+        # Default to ClickHouse if password is available
+        use_clickhouse = st.sidebar.checkbox(
+            "Use ClickHouse",
+            value=bool(saved_ch_password),
+            help="Load IPO data from ClickHouse Cloud"
+        )
+        
+        if use_clickhouse:
+            if saved_ch_password:
+                ch_password = saved_ch_password
+                
+                # Password management in expander
+                with st.sidebar.expander("⚙️ ClickHouse Settings"):
+                    st.caption(f"Host: {CLICKHOUSE_CONFIG['host'][:30]}...")
+                    
+                    new_password = st.text_input(
+                        "Password",
+                        value=saved_ch_password,
+                        type="password",
+                        key="ch_password_input"
+                    )
+                    if new_password != saved_ch_password:
+                        config['clickhouse_password'] = new_password
+                        save_config(config)
+                        st.success("✅ Password updated!")
+                        st.rerun()
+                    
+                    if st.button("🗑️ Clear Password", key="clear_ch_btn"):
+                        config.pop('clickhouse_password', None)
+                        save_config(config)
+                        st.rerun()
+                
+                # Reload button
+                if st.sidebar.button("🔄 Reload Data", key="reload_ch_btn"):
+                    st.cache_data.clear()
+                    st.rerun()
+            else:
+                st.sidebar.info("Enter ClickHouse password")
+                ch_password = st.sidebar.text_input(
+                    "Password",
+                    value='',
+                    type="password",
+                    key="ch_password_new"
+                )
+                if ch_password:
+                    config['clickhouse_password'] = ch_password
+                    save_config(config)
+                    st.sidebar.success("✅ Password saved!")
+                    st.rerun()
+        else:
+            st.sidebar.caption("📁 Using CSV file")
+    
+    # Polygon API key section
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔑 Your API Key")
+    st.sidebar.caption("Each user saves their own key in browser")
+    
+    saved_key = get_polygon_api_key()
+    
+    if saved_key:
+        st.sidebar.success("✅ Your Polygon key is saved")
+        st.sidebar.caption(f"Key: {saved_key[:6]}...{saved_key[-4:]}" if len(saved_key) > 10 else "Key saved")
+        
+        show_key = st.sidebar.checkbox("Show/Edit Key", value=False, key="show_edit_key")
+        if show_key:
+            new_key = st.sidebar.text_input(
+                "Polygon API Key", 
+                value=saved_key,
+                type="password",
+                key="edit_polygon_key",
+                help="Get a free key at polygon.io"
+            )
+            if new_key and new_key != saved_key:
+                save_polygon_api_key(new_key)
+                st.sidebar.success("✅ Key updated!")
+                st.rerun()
+        
+        if st.sidebar.button("🗑️ Clear My Saved Key", key="clear_key_btn"):
+            clear_polygon_api_key()
+            st.rerun()
+    else:
+        st.sidebar.info("💡 Get a free API key at [polygon.io](https://polygon.io)")
+        polygon_key = st.sidebar.text_input(
+            "Polygon API Key", 
+            value='',
+            type="password",
+            key="new_polygon_key",
+            help="Your key is saved in YOUR browser only - not shared"
+        )
+        if polygon_key:
+            save_polygon_api_key(polygon_key)
+            st.sidebar.success("✅ Key saved to your browser!")
+            st.rerun()
+    
+    st.sidebar.markdown("---")
+    
+    # ========================================================================
+    # LOAD DATA (after sidebar settings are defined)
+    # ========================================================================
+    st.session_state['use_clickhouse'] = use_clickhouse
+    st.session_state['ch_password'] = ch_password
+    
+    # Create cache key based on data source settings
+    cache_key = f"ch_{use_clickhouse}_{bool(ch_password)}"
+    df = load_ipo_data(use_clickhouse=use_clickhouse, ch_password=ch_password, _cache_key=cache_key)
+    
+    if df.empty:
+        st.warning("No data loaded. Check your data source configuration.")
+        st.stop()
+    
+    # ========================================================================
+    # UNDERWRITER SELECTION - Extract individual underwriters from combos
+    # ========================================================================
+    
+    # Extract all unique individual underwriters from combo strings
+    def extract_underwriters(uw_series):
+        """Extract individual underwriters from comma-separated strings."""
+        all_uws = set()
+        for uw in uw_series.dropna().unique():
+            # Split by comma and clean
+            parts = re.split(r'[,/]', str(uw))
+            for p in parts:
+                cleaned = p.strip().upper()
+                if cleaned and len(cleaned) > 2:
+                    all_uws.add(cleaned)
+        return sorted(all_uws)
+    
+    # Get underwriter column
+    uw_col = 'underwriter' if 'underwriter' in df.columns else 'IPO Lead' if 'IPO Lead' in df.columns else None
+    
+    if uw_col:
+        all_underwriters = extract_underwriters(df[uw_col])
+    else:
+        all_underwriters = []
+    
+    # Count IPOs per underwriter
+    uw_counts = {}
+    if uw_col:
+        for _, row in df.iterrows():
+            uw = str(row.get(uw_col, ''))
+            for part in re.split(r'[,/]', uw):
+                cleaned = part.strip().upper()
+                if cleaned and len(cleaned) > 2:
+                    uw_counts[cleaned] = uw_counts.get(cleaned, 0) + 1
+    
+    # Create selection with counts
+    uw_options = ["All Underwriters"] + [f"{uw} ({uw_counts.get(uw, 0)})" for uw in all_underwriters]
+    
+    selected_uw_label = st.sidebar.selectbox(
+        "Filter by Underwriter",
+        options=uw_options,
+        index=0,
+        key="uw_filter"
+    )
+    
+    # Extract just the underwriter name
+    if selected_uw_label == "All Underwriters":
+        selected_uw = None
+    else:
+        selected_uw = selected_uw_label.split(" (")[0]
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔎 Ticker Search")
+    
+    # Get all tickers
+    ticker_col = 'ticker_clean' if 'ticker_clean' in df.columns else 'polygon_ticker' if 'polygon_ticker' in df.columns else None
+    if ticker_col:
+        all_tickers = sorted(df[ticker_col].dropna().unique().tolist())
+    else:
+        all_tickers = []
+    
+    st.sidebar.caption(f"Total tickers in data: {len(all_tickers)}")
+    
+    # Search input
+    ticker_search = st.sidebar.text_input(
+        "Search Ticker",
+        value="",
+        placeholder="e.g., WTF, RDDT",
+        key="ticker_search"
+    )
+    
+    # Filter tickers based on search
+    if ticker_search:
+        search_upper = ticker_search.upper().strip()
+        filtered_tickers = [t for t in all_tickers if search_upper in str(t).upper()]
+        if filtered_tickers:
+            st.sidebar.caption(f"Found {len(filtered_tickers)} match(es)")
+            # Auto-select first match if exact match exists
+            exact_match = [t for t in filtered_tickers if str(t).upper() == search_upper]
+            default_idx = 1 if exact_match else 0  # Select first match, or "All Matching"
+        else:
+            st.sidebar.warning(f"'{ticker_search}' not found")
+            filtered_tickers = []
+            default_idx = 0
+    else:
+        filtered_tickers = all_tickers
+        default_idx = 0
+    
+    # Build dropdown options
+    if ticker_search and filtered_tickers:
+        ticker_dropdown_options = ["All Matching"] + filtered_tickers[:100]
+    else:
+        ticker_dropdown_options = ["All Tickers"] + filtered_tickers[:100]
+    
+    selected_ticker_filter = st.sidebar.selectbox(
+        "Select Ticker",
+        options=ticker_dropdown_options,
+        index=min(default_idx, len(ticker_dropdown_options) - 1),
+        key="ticker_select"
+    )
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ Risk Filters")
+    
+    # Risk score filter
+    min_risk = st.sidebar.slider("Min Risk Score", 0, 100, 0, key="min_risk")
+    max_risk = st.sidebar.slider("Max Risk Score", 0, 100, 100, key="max_risk")
+    
+    # Tax haven filter
+    tax_haven_filter = st.sidebar.selectbox(
+        "Tax Haven",
+        options=["All", "Tax Haven Only", "Non-Tax Haven Only"],
+        index=0,
+        key="tax_haven_filter"
+    )
+    
+    # VC backed filter
+    vc_filter = st.sidebar.selectbox(
+        "VC Backed",
+        options=["All", "VC Backed Only", "Non-VC Only"],
+        index=0,
+        key="vc_filter"
+    )
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📈 Bounce Calculation")
+    
+    # Bounce calculation method toggle
+    bounce_method = st.sidebar.radio(
+        "Calculate bounce from:",
+        options=["D1 Open (Day Trading)", "IPO Price (Investment)"],
+        index=0,
+        key="bounce_method",
+        help="D1 Open: How much it ran from first trade. IPO Price: Total return from offering price."
+    )
+    
+    # Set the active bounce column based on selection
+    if bounce_method == "IPO Price (Investment)":
+        bounce_col = 'bounce_vs_ipo'
+        st.sidebar.caption("📊 Bounce = (Lifetime High / IPO Price - 1) × 100")
+    else:
+        bounce_col = 'bounce_vs_d1open'
+        st.sidebar.caption("📊 Bounce = (Lifetime High / D1 Open - 1) × 100")
+    
+    # Store in session state for use throughout
+    st.session_state['bounce_col'] = bounce_col
+    
+    # Update lifetime_hi_vs_ipo to use selected method
+    if bounce_col in df.columns:
+        df['lifetime_hi_vs_ipo'] = df[bounce_col]
+    
+    st.sidebar.markdown("---")
     
     # ========================================================================
     # DETAILED VIEW POPUP - SHOW AT TOP IF SELECTED
@@ -1461,9 +2107,18 @@ def analysis_page():
                                 data = resp.json()
                                 if 'results' in data and data['results']:
                                     bars = pd.DataFrame(data['results'])
-                                    bars['timestamp'] = pd.to_datetime(bars['t'], unit='ms')
+                                    # Convert UTC to EST
+                                    bars['timestamp'] = pd.to_datetime(bars['t'], unit='ms', utc=True)
+                                    bars['timestamp'] = bars['timestamp'].dt.tz_convert('America/New_York').dt.tz_localize(None)
                                     bars = bars.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
                                     bars = bars[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                                    # Filter to regular trading hours (9:30 AM - 4:00 PM EST) for minute data
+                                    if tf == 'minute' and len(bars) > 0:
+                                        bars['hour'] = bars['timestamp'].dt.hour
+                                        bars['minute'] = bars['timestamp'].dt.minute
+                                        bars['time_decimal'] = bars['hour'] + bars['minute'] / 60
+                                        bars = bars[(bars['time_decimal'] >= 9.5) & (bars['time_decimal'] <= 20.0)]
+                                        bars = bars.drop(columns=['hour', 'minute', 'time_decimal'])
                                 else:
                                     st.error("No data returned from Polygon")
                                     bars = pd.DataFrame()
@@ -1503,9 +2158,18 @@ def analysis_page():
                         min_price = bars['low'].min()
                         pct_from_ipo = (max_price / ipo['price'] - 1) * 100
                         
+                        # Set x-axis range for minute data (9:30 AM - 4:00 PM)
+                        x_range = None
+                        if tf == 'minute' and len(bars) > 0:
+                            chart_date = bars['timestamp'].iloc[0].date()
+                            x_start = pd.Timestamp(chart_date).replace(hour=9, minute=30)
+                            x_end = pd.Timestamp(chart_date).replace(hour=20, minute=0)
+                            x_range = [x_start, x_end]
+                        
                         fig.update_layout(
                             title=f"{ipo['ticker']} - {timeframe} | High: ${max_price:.2f} (+{pct_from_ipo:.0f}%) | Low: ${min_price:.2f}",
                             height=500, showlegend=False, template='plotly_white',
+                            xaxis=dict(range=x_range) if x_range else {},
                             xaxis2=dict(rangeslider=dict(visible=True, thickness=0.05))
                         )
                         fig.update_yaxes(title_text="Price ($)", row=1, col=1)
@@ -1535,12 +2199,6 @@ def analysis_page():
         
         st.markdown("---")
         st.markdown("---")
-    
-    # Load data
-    df = load_ipo_data()
-    
-    if df.empty:
-        st.stop()
     
     # ========================================================================
     # OVERALL STATS (Collapsible)
@@ -1582,248 +2240,82 @@ def analysis_page():
         if 'is_tax_haven' in df.columns:
             bounce_data = []
             
-            th_df = df[df['is_tax_haven']]
+            # Convert to boolean for filtering (column contains 0/1 integers)
+            th_df = df[df['is_tax_haven'] == 1]
             if len(th_df) > 0:
                 bounce_data.append({
                     'Type': '🏝️ Tax Haven',
                     'Count': len(th_df),
                     'Median Bounce': f"{th_df['lifetime_hi_vs_ipo'].median():.0f}%",
                     'Bounce >100%': f"{(th_df['lifetime_hi_vs_ipo'] > 100).mean()*100:.0f}%",
-                    'Avg Risk': f"{th_df['operation_risk_score'].mean():.0f}"
+                    'Avg Risk': f"{th_df['operation_risk_score'].mean():.0f}" if 'operation_risk_score' in th_df.columns else "N/A"
                 })
             
             if 'is_us' in df.columns:
-                us_df = df[df['is_us']]
+                us_df = df[df['is_us'] == 1]
                 if len(us_df) > 0:
                     bounce_data.append({
                         'Type': '🇺🇸 US',
                         'Count': len(us_df),
                         'Median Bounce': f"{us_df['lifetime_hi_vs_ipo'].median():.0f}%",
                         'Bounce >100%': f"{(us_df['lifetime_hi_vs_ipo'] > 100).mean()*100:.0f}%",
-                        'Avg Risk': f"{us_df['operation_risk_score'].mean():.0f}"
+                        'Avg Risk': f"{us_df['operation_risk_score'].mean():.0f}" if 'operation_risk_score' in us_df.columns else "N/A"
                     })
                 
-                other_df = df[~df['is_tax_haven'] & ~df['is_us']]
+                other_df = df[(df['is_tax_haven'] == 0) & (df['is_us'] == 0)]
                 if len(other_df) > 0:
                     bounce_data.append({
                         'Type': '🌍 Other',
                         'Count': len(other_df),
                         'Median Bounce': f"{other_df['lifetime_hi_vs_ipo'].median():.0f}%",
                         'Bounce >100%': f"{(other_df['lifetime_hi_vs_ipo'] > 100).mean()*100:.0f}%",
-                        'Avg Risk': f"{other_df['operation_risk_score'].mean():.0f}"
+                        'Avg Risk': f"{other_df['operation_risk_score'].mean():.0f}" if 'operation_risk_score' in other_df.columns else "N/A"
                     })
             
             if bounce_data:
                 st.dataframe(pd.DataFrame(bounce_data), use_container_width=True, hide_index=True)
     
     # ========================================================================
-    # SIDEBAR - FILTERS
-    # ========================================================================
-    st.sidebar.header("🔍 Filters")
-    
-    # Data source selection
-    data_source = st.sidebar.selectbox(
-        "Data Source",
-        options=["sample", "polygon", "clickhouse"],
-        index=0,
-        help="Select your market data source. 'sample' generates demo data."
-    )
-    
-    # Polygon API key (always show, syncs with session state)
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔑 Your API Key")
-    st.sidebar.caption("Each user saves their own key in browser")
-    
-    # Load saved key
-    saved_key = get_polygon_api_key()
-    
-    # Show masked key if exists
-    if saved_key:
-        st.sidebar.success("✅ Your Polygon key is saved")
-        st.sidebar.caption(f"Key: {saved_key[:6]}...{saved_key[-4:]}" if len(saved_key) > 10 else "Key saved")
-        
-        show_key = st.sidebar.checkbox("Show/Edit Key", value=False, key="show_edit_key")
-        if show_key:
-            new_key = st.sidebar.text_input(
-                "Polygon API Key", 
-                value=saved_key,
-                type="password",
-                key="edit_polygon_key",
-                help="Get a free key at polygon.io"
-            )
-            if new_key and new_key != saved_key:
-                save_polygon_api_key(new_key)
-                st.sidebar.success("✅ Key updated!")
-                st.rerun()
-        
-        if st.sidebar.button("🗑️ Clear My Saved Key", key="clear_key_btn"):
-            clear_polygon_api_key()
-            st.rerun()
-    else:
-        st.sidebar.info("💡 Get a free API key at [polygon.io](https://polygon.io)")
-        polygon_key = st.sidebar.text_input(
-            "Polygon API Key", 
-            value='',
-            type="password",
-            key="new_polygon_key",
-            help="Your key is saved in YOUR browser only - not shared"
-        )
-        if polygon_key:
-            save_polygon_api_key(polygon_key)
-            st.sidebar.success("✅ Key saved to your browser!")
-            st.rerun()
-    
-    st.sidebar.markdown("---")
-    
-    # ========================================================================
-    # UNDERWRITER SELECTION - Extract individual underwriters from combos
-    # ========================================================================
-    
-    # Extract all unique individual underwriters from combo strings
-    def extract_underwriters(uw_series):
-        """Extract individual underwriters from comma-separated strings."""
-        all_uws = set()
-        for uw in uw_series.dropna().unique():
-            # Split by comma and clean
-            parts = re.split(r'[,/]', str(uw))
-            for part in parts:
-                clean = part.strip()
-                if clean and clean != 'Unknown':
-                    all_uws.add(clean)
-        return sorted(all_uws)
-    
-    individual_uws = extract_underwriters(df['underwriter'])
-    
-    # Count IPOs for each individual underwriter (partial match)
-    uw_counts = {}
-    for uw in individual_uws:
-        count = df['underwriter'].str.contains(uw, case=False, na=False, regex=False).sum()
-        if count > 0:
-            uw_counts[uw] = count
-    
-    # Sort by count
-    sorted_uws = sorted(uw_counts.items(), key=lambda x: -x[1])
-    
-    # Create dropdown options with counts
-    uw_options = ["All Underwriters"] + [f"{uw} ({count} IPOs)" for uw, count in sorted_uws]
-    uw_map = {"All Underwriters": None}
-    uw_map.update({f"{uw} ({count} IPOs)": uw for uw, count in sorted_uws})
-    
-    selected_uw_label = st.sidebar.selectbox(
-        "Search Underwriter (partial match)",
-        options=uw_options,
-        index=0,
-        help="Select an underwriter - will match any IPO where this name appears"
-    )
-    
-    selected_uw = uw_map[selected_uw_label]
-    
-    # ========================================================================
-    # TICKER SEARCH - Filter by ticker symbol
-    # ========================================================================
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔎 Ticker Search")
-    
-    # Get all tickers sorted alphabetically
-    all_tickers = sorted(df['ticker_clean'].dropna().unique().tolist())
-    ticker_options = ["All Tickers"] + all_tickers
-    
-    # Show total count
-    st.sidebar.caption(f"Total tickers in data: {len(all_tickers)}")
-    
-    # Text input for quick search
-    ticker_search = st.sidebar.text_input(
-        "Search Ticker",
-        value="",
-        placeholder="Type ticker (e.g., WTF, SLGB)",
-        help="Type to filter tickers, or select from dropdown"
-    ).upper().strip()
-    
-    # Filter ticker list based on search
-    if ticker_search:
-        filtered_tickers = [t for t in all_tickers if ticker_search in t.upper()]
-        if filtered_tickers:
-            ticker_options = ["All Matching"] + filtered_tickers
-            st.sidebar.success(f"Found {len(filtered_tickers)} match(es)")
-        else:
-            ticker_options = ["No matches found"]
-            st.sidebar.warning(f"'{ticker_search}' not found in {len(all_tickers)} tickers")
-    
-    selected_ticker_filter = st.sidebar.selectbox(
-        "Select Ticker",
-        options=ticker_options,
-        index=0,
-        help="Filter to show only this ticker"
-    )
-    
-    # Filter options
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("⚙️ Risk Filters")
-    
-    min_risk = st.sidebar.slider("Min Risk Score", 0, 100, 0)
-    
-    date_range = st.sidebar.date_input(
-        "IPO Date Range",
-        value=(df['date'].min().date(), df['date'].max().date()),
-        min_value=df['date'].min().date(),
-        max_value=df['date'].max().date()
-    )
-    
-    # New heuristic filters
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🎯 Heuristic Filters")
-    
-    # Country filter
-    country_filter = st.sidebar.radio(
-        "Country Type",
-        options=["All", "Tax Haven Only", "US Only", "Other"],
-        index=0
-    )
-    
-    # Checkboxes for additional filters
-    col_a, col_b = st.sidebar.columns(2)
-    with col_a:
-        show_operation_uw = st.sidebar.checkbox("Operation UW", value=False, 
-                                                 help="Show only IPOs with operation underwriters")
-    with col_b:
-        show_no_vc = st.sidebar.checkbox("No VC", value=False,
-                                          help="Show only non-VC backed IPOs")
-    
-    # ========================================================================
     # MAIN CONTENT
     # ========================================================================
     
     # Build filter mask
-    mask = (
-        (df['operation_risk_score'] >= min_risk) &
-        (df['date'].dt.date >= date_range[0]) &
-        (df['date'].dt.date <= date_range[1])
-    )
+    mask = pd.Series([True] * len(df), index=df.index)
+    
+    # Apply risk score filter
+    if 'operation_risk_score' in df.columns:
+        mask &= (df['operation_risk_score'] >= min_risk) & (df['operation_risk_score'] <= max_risk)
     
     # Apply underwriter filter (partial match)
-    if selected_uw is not None:
-        mask &= df['underwriter'].str.contains(selected_uw, case=False, na=False, regex=False)
+    if selected_uw is not None and uw_col:
+        mask &= df[uw_col].str.contains(selected_uw, case=False, na=False, regex=False)
     
     # Apply ticker filter
-    if selected_ticker_filter not in ["All Tickers", "All Matching", "No matches found"]:
-        mask &= df['ticker_clean'] == selected_ticker_filter
-    elif ticker_search and selected_ticker_filter == "All Matching":
-        # Filter to all tickers containing the search term
-        mask &= df['ticker_clean'].str.contains(ticker_search, case=False, na=False)
+    if ticker_search:
+        search_upper = ticker_search.upper().strip()
+        if selected_ticker_filter == "All Matching":
+            # Filter to all matching tickers
+            mask &= df[ticker_col].str.upper().str.contains(search_upper, na=False)
+        elif selected_ticker_filter not in ["All Tickers", "All Matching", "No matches found"]:
+            # Specific ticker selected
+            mask &= df[ticker_col] == selected_ticker_filter
+        else:
+            # Search text entered but "All Tickers" still selected - apply search anyway
+            mask &= df[ticker_col].str.upper().str.contains(search_upper, na=False)
+    elif selected_ticker_filter not in ["All Tickers", "All Matching", "No matches found"] and ticker_col:
+        mask &= df[ticker_col] == selected_ticker_filter
     
-    # Apply country filter
-    if country_filter == "Tax Haven Only" and 'is_tax_haven' in df.columns:
-        mask &= df['is_tax_haven']
-    elif country_filter == "US Only" and 'is_us' in df.columns:
-        mask &= df['is_us']
-    elif country_filter == "Other" and 'is_tax_haven' in df.columns and 'is_us' in df.columns:
-        mask &= ~df['is_tax_haven'] & ~df['is_us']
+    # Apply tax haven filter
+    if tax_haven_filter == "Tax Haven Only" and 'is_tax_haven' in df.columns:
+        mask &= df['is_tax_haven'] == 1
+    elif tax_haven_filter == "Non-Tax Haven Only" and 'is_tax_haven' in df.columns:
+        mask &= df['is_tax_haven'] == 0
     
-    # Apply heuristic filters
-    if show_operation_uw and 'has_operation_underwriter' in df.columns:
-        mask &= df['has_operation_underwriter']
-    if show_no_vc and 'vc_backed' in df.columns:
-        mask &= ~df['vc_backed']
+    # Apply VC backed filter
+    if vc_filter == "VC Backed Only" and 'vc_backed' in df.columns:
+        mask &= df['vc_backed'] == 1
+    elif vc_filter == "Non-VC Only" and 'vc_backed' in df.columns:
+        mask &= df['vc_backed'] == 0
     
     filtered_df = df[mask].sort_values('date', ascending=False)
     
@@ -2079,12 +2571,22 @@ def analysis_page():
                 data = resp.json()
                 if 'results' in data and data['results']:
                     df = pd.DataFrame(data['results'])
-                    df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
+                    # Convert UTC to EST
+                    df['timestamp'] = pd.to_datetime(df['t'], unit='ms', utc=True)
+                    df['timestamp'] = df['timestamp'].dt.tz_convert('America/New_York').dt.tz_localize(None)
                     df = df.rename(columns={
                         'o': 'open', 'h': 'high', 'l': 'low', 
                         'c': 'close', 'v': 'volume'
                     })
-                    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                    # Filter to regular trading hours (9:30 AM - 4:00 PM EST) for minute data
+                    if timeframe == 'minute' and len(df) > 0:
+                        df['hour'] = df['timestamp'].dt.hour
+                        df['minute'] = df['timestamp'].dt.minute
+                        df['time_decimal'] = df['hour'] + df['minute'] / 60
+                        df = df[(df['time_decimal'] >= 9.5) & (df['time_decimal'] <= 20.0)]
+                        df = df.drop(columns=['hour', 'minute', 'time_decimal'])
+                    return df
             else:
                 st.warning(f"Polygon API error: {resp.status_code} - {resp.text[:100]}")
                 
@@ -2247,12 +2749,20 @@ def analysis_page():
             if '1min' in title.lower() or 'minute' in title.lower():
                 tick_format = '%H:%M'
                 dtick = None  # Auto
+                # Set x-axis range from 9:30 AM to 4:00 PM
+                chart_date = df['timestamp'].iloc[0].date()
+                x_start = pd.Timestamp(chart_date).replace(hour=9, minute=30)
+                x_end = pd.Timestamp(chart_date).replace(hour=20, minute=0)
             elif 'month' in title.lower():
                 tick_format = '%m/%d'
                 dtick = 'D7'  # Weekly ticks
+                x_start = None
+                x_end = None
             else:  # Lifetime
                 tick_format = '%Y-%m'
                 dtick = 'M3'  # Quarterly ticks
+                x_start = None
+                x_end = None
             
             fig.update_layout(
                 title=dict(text=f"{title} ({pct_change:+.0f}%)", font_size=10, x=0.5),
@@ -2266,6 +2776,7 @@ def analysis_page():
                     tickfont=dict(size=8),
                     tickangle=-45,
                     nticks=5,  # Limit number of ticks
+                    range=[x_start, x_end] if x_start else None,
                 ),
                 yaxis=dict(
                     showticklabels=True, 
@@ -2286,6 +2797,8 @@ def analysis_page():
             ipo_dt = row['date']
             price = row['IPO Sh Px'] if pd.notna(row['IPO Sh Px']) else 4.0
             bounce = row['lifetime_hi_vs_ipo'] if pd.notna(row['lifetime_hi_vs_ipo']) else 0
+            bounce_d1 = row.get('bounce_vs_d1open', bounce) if pd.notna(row.get('bounce_vs_d1open', 0)) else 0
+            bounce_ipo = row.get('bounce_vs_ipo', bounce) if pd.notna(row.get('bounce_vs_ipo', 0)) else 0
             name = str(row.get('Name', ''))[:40]
             
             # Row container with border
@@ -2294,7 +2807,7 @@ def analysis_page():
                 header_col1, header_col2, header_col3 = st.columns([4, 1, 1])
                 with header_col1:
                     st.markdown(f"**{i+1}. {ticker}** - {name}")
-                    st.caption(f"IPO: {ipo_dt.strftime('%Y-%m-%d')} | ${price:.0f} | Bounce: {bounce:.0f}%")
+                    st.caption(f"IPO: {ipo_dt.strftime('%Y-%m-%d')} | ${price:.2f} | D1: {bounce_d1:.0f}% | IPO: {bounce_ipo:.0f}%")
                 with header_col2:
                     if st.button("📊 Expand", key=f"detail_btn_{ticker}_{i}", 
                                 help="Click to view detailed chart with Polygon data",
