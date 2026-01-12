@@ -1253,6 +1253,7 @@ def underwriter_opportunities_page():
         # Format columns for display
         display_opps['IPO Date'] = display_opps['ipo_date_parsed'].dt.strftime('%Y-%m-%d')
         display_opps['IPO Px'] = display_opps['ipo_price'].apply(lambda x: f"${x:.2f}")
+        display_opps['Life Hi'] = display_opps['lifetime_high'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
         display_opps['Current'] = display_opps['current_price'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
         display_opps['Return'] = display_opps['current_return_pct'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
         display_opps['Close to 2x'] = display_opps['close_to_double_pct'].apply(lambda x: f"{x:.0f}%")
@@ -1262,12 +1263,12 @@ def underwriter_opportunities_page():
         # Get name column
         name_col = 'Name' if 'Name' in display_opps.columns else 'name'
         if name_col in display_opps.columns:
-            display_opps['Company'] = display_opps[name_col].astype(str).str[:30]
+            display_opps['Company'] = display_opps[name_col].astype(str).str[:25]
         else:
             display_opps['Company'] = ''
 
         st.dataframe(
-            display_opps[[ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Current', 'Return', 'Close to 2x', 'Upside', 'UW Rate']].rename(columns={
+            display_opps[[ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'UW Rate']].rename(columns={
                 ticker_col: 'Ticker',
                 'underwriter_clean': 'Underwriter'
             }),
@@ -1278,6 +1279,7 @@ def underwriter_opportunities_page():
         # Legend
         st.markdown("""
         **Legend:**
+        - **Life Hi**: Lifetime high price (adjusted for splits, capped at 50x IPO)
         - **Close to 2x**: How close lifetime high got to 2x IPO price (100% = hit double)
         - **Upside**: Potential gain if stock reaches 2x IPO price from current price
         - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
