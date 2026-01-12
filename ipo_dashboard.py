@@ -1073,8 +1073,25 @@ def underwriter_opportunities_page():
 
     # Clean up columns
     df_analysis['ipo_price'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
-    df_analysis['lifetime_high'] = pd.to_numeric(df_analysis.get('Lifetime High', df_analysis.get('lifetime_high', 0)), errors='coerce')
+    df_analysis['lifetime_high_raw'] = pd.to_numeric(df_analysis.get('Lifetime High', df_analysis.get('lifetime_high', 0)), errors='coerce')
     df_analysis['current_price'] = pd.to_numeric(df_analysis.get('last_px_adj', df_analysis.get('current_price', 0)), errors='coerce')
+
+    # Get split factor for adjustment (default to 1 if not available)
+    df_analysis['split_factor'] = pd.to_numeric(df_analysis.get('cum_split_factor_since_base', 1), errors='coerce').fillna(1)
+    df_analysis['split_factor'] = df_analysis['split_factor'].replace(0, 1)  # Avoid division by zero
+
+    # Adjust lifetime high for splits (divide by split factor to get adjusted price)
+    # This ensures we compare apples to apples with the IPO price
+    df_analysis['lifetime_high'] = df_analysis['lifetime_high_raw'] / df_analysis['split_factor']
+
+    # Cap lifetime high at reasonable multiple of IPO price to handle bad data
+    # (some tickers have incorrect split factors or unadjusted lifetime highs)
+    # A 50x gain (5000%) is extremely rare but possible; anything beyond is likely data error
+    MAX_REASONABLE_MULTIPLE = 50
+    df_analysis['lifetime_high'] = np.minimum(
+        df_analysis['lifetime_high'],
+        df_analysis['ipo_price'] * MAX_REASONABLE_MULTIPLE
+    )
 
     # Get underwriter column
     uw_col = 'underwriter' if 'underwriter' in df_analysis.columns else 'IPO Lead'
@@ -1164,7 +1181,8 @@ def underwriter_opportunities_page():
 
     display_uw = uw_stats.head(15).copy()
     display_uw['Double Rate'] = display_uw['double_rate'].apply(lambda x: f"{x:.1f}%")
-    display_uw['Avg Max Gain'] = display_uw['avg_max_gain'].apply(lambda x: f"{x:.0f}%" if x < 10000 else f"{x/1000:.0f}k%")
+    # Use median for display (more robust against outliers)
+    display_uw['Median Max Gain'] = display_uw['median_max_gain'].apply(lambda x: f"{x:.0f}%")
     display_uw = display_uw.rename(columns={
         'underwriter_clean': 'Underwriter',
         'total_ipos': 'Total IPOs',
@@ -1172,7 +1190,7 @@ def underwriter_opportunities_page():
     })
 
     st.dataframe(
-        display_uw[['Underwriter', 'Total IPOs', 'Doubled', 'Double Rate', 'Avg Max Gain']],
+        display_uw[['Underwriter', 'Total IPOs', 'Doubled', 'Double Rate', 'Median Max Gain']],
         width="stretch",
         hide_index=True
     )
