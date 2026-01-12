@@ -19,7 +19,7 @@ Usage:
 """
 
 # VERSION - Update when making changes to verify user has latest code
-DASHBOARD_VERSION = "2.1.4-afterhours"
+DASHBOARD_VERSION = "2.2.0-opportunities"
 
 import streamlit as st
 import pandas as pd
@@ -1006,25 +1006,315 @@ def create_summary_chart(df: pd.DataFrame, title: str) -> go.Figure:
 
 
 # ============================================================================
+# AUTO-SYNC ON STARTUP
+# ============================================================================
+
+def check_and_sync_on_startup():
+    """Check if CSV has newer data than ClickHouse and sync if needed."""
+    if not HAS_CLICKHOUSE:
+        return
+
+    try:
+        config = load_config()
+        ch_password = config.get('clickhouse_password', '') or os.environ.get('CLICKHOUSE_PASSWORD', '')
+        if not ch_password:
+            return
+
+        client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_CONFIG['host'],
+            port=8443,
+            username=CLICKHOUSE_CONFIG['user'],
+            password=ch_password,
+            secure=True,
+            database='market_data'
+        )
+
+        # Get ClickHouse row count
+        ch_count = client.query("SELECT count(*) FROM ipo_master").result_rows[0][0]
+
+        # Get CSV row count
+        csv_path = os.path.join(os.path.dirname(__file__), 'eqsipo_final.csv')
+        if os.path.exists(csv_path):
+            csv_df = pd.read_csv(csv_path, usecols=[0], nrows=None)
+            csv_count = len(csv_df)
+
+            if csv_count > ch_count:
+                st.toast(f"📊 CSV has {csv_count - ch_count} more IPOs than ClickHouse. Consider syncing.", icon="ℹ️")
+    except Exception:
+        pass  # Silent fail - don't block dashboard startup
+
+
+# ============================================================================
+# UNDERWRITER OPPORTUNITIES PAGE
+# ============================================================================
+
+def underwriter_opportunities_page():
+    """Page showing underwriter-based buying opportunities for low-dollar IPOs."""
+    st.header("💰 Underwriter Opportunities")
+    st.markdown("*Find low-dollar IPOs from high-success underwriters that haven't doubled yet*")
+
+    # Load data
+    use_ch = st.session_state.get('use_clickhouse', False)
+    ch_pw = st.session_state.get('ch_password', None)
+    cache_key = f"ch_{use_ch}_{bool(ch_pw)}"
+    df = load_ipo_data(use_clickhouse=use_ch, ch_password=ch_pw, _cache_key=cache_key)
+
+    if df.empty:
+        st.warning("No data loaded. Please configure data source in the Analysis tab.")
+        return
+
+    # Prepare data for analysis
+    df_analysis = df.copy()
+
+    # Ensure we have required columns
+    if 'IPO Sh Px' not in df_analysis.columns:
+        st.error("Missing IPO price column")
+        return
+
+    # Clean up columns
+    df_analysis['ipo_price'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
+    df_analysis['lifetime_high'] = pd.to_numeric(df_analysis.get('Lifetime High', df_analysis.get('lifetime_high', 0)), errors='coerce')
+    df_analysis['current_price'] = pd.to_numeric(df_analysis.get('last_px_adj', df_analysis.get('current_price', 0)), errors='coerce')
+
+    # Get underwriter column
+    uw_col = 'underwriter' if 'underwriter' in df_analysis.columns else 'IPO Lead'
+    if uw_col in df_analysis.columns:
+        df_analysis['underwriter_clean'] = df_analysis[uw_col].astype(str).str.upper().str.strip()
+    else:
+        st.error("Missing underwriter column")
+        return
+
+    # Parse dates
+    date_col = 'ipo_date' if 'ipo_date' in df_analysis.columns else 'date'
+    if date_col in df_analysis.columns:
+        df_analysis['ipo_date_parsed'] = pd.to_datetime(df_analysis[date_col], errors='coerce')
+    else:
+        st.error("Missing IPO date column")
+        return
+
+    # Get ticker column
+    ticker_col = 'ticker_clean' if 'ticker_clean' in df_analysis.columns else 'polygon_ticker'
+    if ticker_col not in df_analysis.columns:
+        df_analysis['ticker_clean'] = df_analysis['Ticker'].astype(str).str.replace(' US Equity', '').str.strip() if 'Ticker' in df_analysis.columns else 'N/A'
+        ticker_col = 'ticker_clean'
+
+    # ========================================================================
+    # FILTERS
+    # ========================================================================
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        low_dollar_min = st.number_input("Min IPO Price ($)", value=2.0, min_value=0.0, max_value=50.0, step=0.5)
+    with col2:
+        low_dollar_max = st.number_input("Max IPO Price ($)", value=10.0, min_value=0.0, max_value=100.0, step=1.0)
+    with col3:
+        lookback_months = st.slider("Lookback Period (months)", 6, 24, 12)
+
+    col4, col5 = st.columns(2)
+    with col4:
+        min_uw_ipos = st.slider("Min IPOs per Underwriter", 2, 10, 3)
+    with col5:
+        min_double_rate = st.slider("Min Double Rate (%)", 0, 100, 40)
+
+    # ========================================================================
+    # CALCULATE METRICS
+    # ========================================================================
+
+    # Filter for low dollar IPOs
+    low_dollar = df_analysis[
+        (df_analysis['ipo_price'] >= low_dollar_min) &
+        (df_analysis['ipo_price'] <= low_dollar_max) &
+        (df_analysis['ipo_price'] > 0)
+    ].copy()
+
+    if len(low_dollar) == 0:
+        st.warning(f"No IPOs found in the ${low_dollar_min}-${low_dollar_max} price range")
+        return
+
+    # Calculate metrics
+    low_dollar['hit_double'] = low_dollar['lifetime_high'] >= (low_dollar['ipo_price'] * 2)
+    low_dollar['max_gain_pct'] = np.where(
+        low_dollar['ipo_price'] > 0,
+        ((low_dollar['lifetime_high'] - low_dollar['ipo_price']) / low_dollar['ipo_price']) * 100,
+        0
+    )
+    low_dollar['current_return_pct'] = np.where(
+        (low_dollar['ipo_price'] > 0) & (low_dollar['current_price'] > 0),
+        ((low_dollar['current_price'] - low_dollar['ipo_price']) / low_dollar['ipo_price']) * 100,
+        np.nan
+    )
+
+    # ========================================================================
+    # UNDERWRITER STATISTICS
+    # ========================================================================
+    st.subheader("📊 Underwriter Performance (Low Dollar IPOs)")
+
+    uw_stats = low_dollar.groupby('underwriter_clean').agg(
+        total_ipos=(ticker_col, 'count'),
+        doubled_count=('hit_double', 'sum'),
+        avg_max_gain=('max_gain_pct', 'mean'),
+        median_max_gain=('max_gain_pct', 'median'),
+    ).reset_index()
+
+    uw_stats['double_rate'] = (uw_stats['doubled_count'] / uw_stats['total_ipos']) * 100
+    uw_stats = uw_stats[uw_stats['total_ipos'] >= min_uw_ipos].sort_values('double_rate', ascending=False)
+
+    # Display top underwriters
+    st.markdown(f"**Top Underwriters by Double Rate** (min {min_uw_ipos} IPOs)")
+
+    display_uw = uw_stats.head(15).copy()
+    display_uw['Double Rate'] = display_uw['double_rate'].apply(lambda x: f"{x:.1f}%")
+    display_uw['Avg Max Gain'] = display_uw['avg_max_gain'].apply(lambda x: f"{x:.0f}%" if x < 10000 else f"{x/1000:.0f}k%")
+    display_uw = display_uw.rename(columns={
+        'underwriter_clean': 'Underwriter',
+        'total_ipos': 'Total IPOs',
+        'doubled_count': 'Doubled'
+    })
+
+    st.dataframe(
+        display_uw[['Underwriter', 'Total IPOs', 'Doubled', 'Double Rate', 'Avg Max Gain']],
+        width="stretch",
+        hide_index=True
+    )
+
+    # ========================================================================
+    # OPPORTUNITIES TABLE
+    # ========================================================================
+    st.subheader("🎯 Buying Opportunities")
+    st.markdown(f"*Recent IPOs from high-success underwriters that haven't doubled yet*")
+
+    # Filter for recent IPOs that haven't doubled
+    cutoff_date = datetime.now() - timedelta(days=lookback_months * 30)
+
+    # Get high success underwriters
+    high_success_uw = uw_stats[uw_stats['double_rate'] >= min_double_rate]['underwriter_clean'].tolist()
+
+    opportunities = low_dollar[
+        (low_dollar['underwriter_clean'].isin(high_success_uw)) &
+        (low_dollar['hit_double'] == False) &
+        (low_dollar['ipo_date_parsed'] >= cutoff_date) &
+        (low_dollar['current_price'].notna()) &
+        (low_dollar['current_price'] > 0)
+    ].copy()
+
+    # Merge with underwriter stats
+    opportunities = opportunities.merge(
+        uw_stats[['underwriter_clean', 'double_rate', 'total_ipos', 'doubled_count']],
+        on='underwriter_clean',
+        how='left'
+    )
+
+    # Calculate opportunity metrics
+    opportunities['close_to_double_pct'] = np.where(
+        opportunities['ipo_price'] > 0,
+        (opportunities['lifetime_high'] / (opportunities['ipo_price'] * 2)) * 100,
+        0
+    )
+    opportunities['upside_to_double'] = np.where(
+        opportunities['current_price'] > 0,
+        ((opportunities['ipo_price'] * 2 - opportunities['current_price']) / opportunities['current_price']) * 100,
+        0
+    )
+
+    # Sort by opportunity score
+    opportunities['opp_score'] = (
+        opportunities['double_rate'] * 0.4 +
+        opportunities['close_to_double_pct'].clip(0, 100) * 0.3 +
+        opportunities['upside_to_double'].clip(0, 300) * 0.3
+    )
+    opportunities = opportunities.sort_values('opp_score', ascending=False)
+
+    if len(opportunities) == 0:
+        st.info("No opportunities found matching current filters. Try adjusting the parameters.")
+    else:
+        st.success(f"Found **{len(opportunities)}** potential opportunities")
+
+        # Display table
+        display_opps = opportunities.head(25).copy()
+
+        # Format columns for display
+        display_opps['IPO Date'] = display_opps['ipo_date_parsed'].dt.strftime('%Y-%m-%d')
+        display_opps['IPO Px'] = display_opps['ipo_price'].apply(lambda x: f"${x:.2f}")
+        display_opps['Current'] = display_opps['current_price'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
+        display_opps['Return'] = display_opps['current_return_pct'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
+        display_opps['Close to 2x'] = display_opps['close_to_double_pct'].apply(lambda x: f"{x:.0f}%")
+        display_opps['Upside'] = display_opps['upside_to_double'].apply(lambda x: f"{x:.0f}%")
+        display_opps['UW Rate'] = display_opps['double_rate'].apply(lambda x: f"{x:.0f}%")
+
+        # Get name column
+        name_col = 'Name' if 'Name' in display_opps.columns else 'name'
+        if name_col in display_opps.columns:
+            display_opps['Company'] = display_opps[name_col].astype(str).str[:30]
+        else:
+            display_opps['Company'] = ''
+
+        st.dataframe(
+            display_opps[[ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Current', 'Return', 'Close to 2x', 'Upside', 'UW Rate']].rename(columns={
+                ticker_col: 'Ticker',
+                'underwriter_clean': 'Underwriter'
+            }),
+            width="stretch",
+            hide_index=True
+        )
+
+        # Legend
+        st.markdown("""
+        **Legend:**
+        - **Close to 2x**: How close lifetime high got to 2x IPO price (100% = hit double)
+        - **Upside**: Potential gain if stock reaches 2x IPO price from current price
+        - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
+        """)
+
+    # ========================================================================
+    # KNOWN OPERATION UNDERWRITERS
+    # ========================================================================
+    with st.expander("📋 Known 'Operation' Underwriters Reference"):
+        st.markdown("""
+        These underwriters are associated with small-cap/low-dollar IPOs that historically show "pump" patterns:
+
+        **High Success Rate (>70%):**
+        - Prime Number Capital, Viewtrade Securities, Univest Securities
+        - Spartan Capital, Dawson James, EF Hutton
+        - Network 1 Financial, Boustead Securities, Aegis Capital
+
+        **Moderate Success Rate (50-70%):**
+        - Maxim Group, ThinkEquity, Joseph Stone Capital
+        - RF Lafferty, Kingswood Capital, D Boral Capital
+        - US Tiger Securities, Cathay Securities
+
+        ⚠️ **Warning**: High double rates come with high volatility and crash risk. These patterns are associated with pump-and-dump activity.
+        """)
+
+
+# ============================================================================
 # MAIN APP
 # ============================================================================
 
 def main():
     st.title("📈 IPO Operation Analysis Dashboard")
-    
+
+    # Auto-sync check on startup (only once per session)
+    if 'startup_sync_done' not in st.session_state:
+        st.session_state.startup_sync_done = True
+        # Check if CSV has newer data than ClickHouse and offer to sync
+        check_and_sync_on_startup()
+
     # Create tabs for different views
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Analysis", "🆕 Upcoming IPOs", "📈 Statistics & Prediction", "ℹ️ About"])
-    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Analysis", "💰 Opportunities", "🆕 Upcoming IPOs", "📈 Statistics & Prediction", "ℹ️ About"])
+
     with tab1:
         analysis_page()
-    
+
     with tab2:
-        upcoming_ipos_page()
-    
+        underwriter_opportunities_page()
+
     with tab3:
-        statistics_page()
-    
+        upcoming_ipos_page()
+
     with tab4:
+        statistics_page()
+
+    with tab5:
         about_page()
 
 
@@ -1097,7 +1387,7 @@ def statistics_page():
                 xaxis_tickangle=-45
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
             # Key correlations with bounce
             if 'lifetime_hi_vs_ipo' in selected_cols:
@@ -1172,7 +1462,7 @@ def statistics_page():
                         height=400
                     )
                     
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                     
                     # Interpretation
                     st.markdown("### Interpretation")
@@ -1297,7 +1587,7 @@ def statistics_page():
                     height=300
                 )
                 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 
                 # Percentiles
                 st.markdown("### Bounce Percentiles")
@@ -1308,7 +1598,7 @@ def statistics_page():
                     'Percentile': [f'{p}th' for p in percentiles],
                     'Bounce (%)': [f'{v:.0f}%' for v in pct_values]
                 })
-                st.dataframe(pct_df, use_container_width=True, hide_index=True)
+                st.dataframe(pct_df, width="stretch", hide_index=True)
     
     # ========================================================================
     # TAB 4: FACTOR ANALYSIS
@@ -1345,7 +1635,7 @@ def statistics_page():
             yaxis_title='Median Bounce (%)'
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         
         # By Country
         if 'Cntry Terrtry Of Inc' in df.columns:
@@ -1371,7 +1661,7 @@ def statistics_page():
                 yaxis_title='Median Bounce (%)'
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         
         # By Price Bucket
         st.markdown("### Bounce by IPO Price Range")
@@ -1399,7 +1689,7 @@ def statistics_page():
             yaxis_title='Median Bounce (%)'
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         
         # Summary Table
         st.markdown("### Summary Statistics by Risk Level")
@@ -1421,7 +1711,7 @@ def statistics_page():
         risk_stats['Avg Price'] = risk_stats['Avg Price'].apply(lambda x: f'${x:.2f}')
         risk_stats['Avg Shares'] = risk_stats['Avg Shares'].apply(lambda x: f'{x/1e6:.1f}M')
         
-        st.dataframe(risk_stats, use_container_width=True, hide_index=True)
+        st.dataframe(risk_stats, width="stretch", hide_index=True)
 
 
 def about_page():
@@ -1482,7 +1772,7 @@ def upcoming_ipos_page():
     upcoming_df = fetch_upcoming_ipos()
     
     if upcoming_df is not None and len(upcoming_df) > 0:
-        st.dataframe(upcoming_df, use_container_width=True, hide_index=True)
+        st.dataframe(upcoming_df, width="stretch", hide_index=True)
         
         # Alert section
         st.markdown("---")
@@ -1507,7 +1797,7 @@ def upcoming_ipos_page():
             'Underwriter': ['D Boral', 'Maxim', 'EF Hutton'],
             'Exchange': ['NASDAQ', 'NASDAQ', 'NYSE']
         })
-        st.dataframe(sample_data, use_container_width=True, hide_index=True)
+        st.dataframe(sample_data, width="stretch", hide_index=True)
     
     # Instructions for setting up alerts
     st.markdown("---")
@@ -2175,7 +2465,7 @@ def analysis_page():
                         fig.update_yaxes(title_text="Price ($)", row=1, col=1)
                         fig.update_yaxes(title_text="Volume", row=2, col=1)
                         
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                         
                         # Stats row
                         st_col1, st_col2, st_col3, st_col4 = st.columns(4)
@@ -2273,7 +2563,7 @@ def analysis_page():
                     })
             
             if bounce_data:
-                st.dataframe(pd.DataFrame(bounce_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(bounce_data), width="stretch", hide_index=True)
     
     # ========================================================================
     # MAIN CONTENT
@@ -2428,7 +2718,7 @@ def analysis_page():
     if 'Underwriter' in display_df.columns:
         display_df['Underwriter'] = display_df['Underwriter'].apply(lambda x: str(x)[:20] if pd.notna(x) and str(x).strip() else "Unknown")
     
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df, width="stretch", hide_index=True)
     
     st.markdown("---")
     
@@ -2505,7 +2795,7 @@ def analysis_page():
                              data_source=data_source)
         
         fig1 = create_candlestick_chart(d1_bars, f"{selected_ticker} - Day 1 (1-Min)", height=450)
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, width="stretch")
         
         # Chart 2: First Month - Daily Bars
         st.markdown("### 📅 First Month (Daily Bars)")
@@ -2518,7 +2808,7 @@ def analysis_page():
                              data_source=data_source)
         
         fig2 = create_candlestick_chart(m1_bars, f"{selected_ticker} - First Month (Daily)", height=450)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
         
         # Chart 3: First Year - Daily Bars
         st.markdown("### 📆 First Year (Daily Bars)")
@@ -2534,7 +2824,7 @@ def analysis_page():
                              data_source=data_source)
         
         fig3 = create_candlestick_chart(y1_bars, f"{selected_ticker} - First Year (Daily)", height=450)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
     
     # ========================================================================
     # DETAILED CHART HELPER FUNCTIONS
@@ -2811,13 +3101,13 @@ def analysis_page():
                 with header_col2:
                     if st.button("📊 Expand", key=f"detail_btn_{ticker}_{i}", 
                                 help="Click to view detailed chart with Polygon data",
-                                type="primary", use_container_width=True):
+                                type="primary", width="stretch"):
                         show_detailed_chart(ticker, ipo_dt, price, name)
                         st.rerun()
                 with header_col3:
                     # Link to external chart
                     st.link_button("📈 Yahoo", f"https://finance.yahoo.com/quote/{ticker}", 
-                                   use_container_width=True)
+                                   width="stretch")
             
             col1, col2, col3 = st.columns(3)
             
@@ -2826,7 +3116,7 @@ def analysis_page():
                 d1_start = ipo_dt.strftime('%Y-%m-%d')
                 d1_bars = fetch_bars(ticker, d1_start, d1_start, "minute", price, data_source)
                 fig1 = create_mini_chart(d1_bars, "Day 1 (1min)")
-                st.plotly_chart(fig1, use_container_width=True, key=f"d1_{ticker}_{i}")
+                st.plotly_chart(fig1, width="stretch", key=f"d1_{ticker}_{i}")
             
             with col2:
                 # First month - daily
@@ -2834,7 +3124,7 @@ def analysis_page():
                 m1_end = (ipo_dt + timedelta(days=30)).strftime('%Y-%m-%d')
                 m1_bars = fetch_bars(ticker, m1_start, m1_end, "day", price, data_source)
                 fig2 = create_mini_chart(m1_bars, "Month (daily)")
-                st.plotly_chart(fig2, use_container_width=True, key=f"m1_{ticker}_{i}")
+                st.plotly_chart(fig2, width="stretch", key=f"m1_{ticker}_{i}")
             
             with col3:
                 # Lifetime - daily
@@ -2842,7 +3132,7 @@ def analysis_page():
                 lt_end = datetime.now().strftime('%Y-%m-%d')
                 lt_bars = fetch_bars(ticker, lt_start, lt_end, "day", price, data_source)
                 fig3 = create_mini_chart(lt_bars, "Lifetime (daily)")
-                st.plotly_chart(fig3, use_container_width=True, key=f"lt_{ticker}_{i}")
+                st.plotly_chart(fig3, width="stretch", key=f"lt_{ticker}_{i}")
             
             st.markdown("---")
     
