@@ -56,7 +56,7 @@ CLICKHOUSE_CONFIG = {
     'host': os.environ.get('CLICKHOUSE_HOST', 'i35q8zrtq4.us-east-2.aws.clickhouse.cloud'),
     'port': int(os.environ.get('CLICKHOUSE_PORT', '443')),
     'user': os.environ.get('CLICKHOUSE_USER', 'default'),
-    'password': os.environ.get('CLICKHOUSE_PASSWORD', ''),
+    'password': os.environ.get('CLICKHOUSE_PASSWORD', '~AiDc7hJ7m1Bv'),
     'database': os.environ.get('CLICKHOUSE_DATABASE', 'ipo'),
     'table': os.environ.get('CLICKHOUSE_TABLE', 'ipo_master'),
     'secure': True,
@@ -2303,13 +2303,21 @@ def analysis_page():
         st.sidebar.caption("📁 Using CSV fallback")
     else:
         config = load_config()
-        saved_ch_password = config.get('clickhouse_password', '') or os.environ.get('CLICKHOUSE_PASSWORD', '')
-        
-        # Default to ClickHouse if password is available
+        # Check for password in: 1) Streamlit secrets, 2) saved config, 3) environment variable, 4) default config
+        saved_ch_password = ''
+        try:
+            if hasattr(st, 'secrets') and 'CLICKHOUSE_PASSWORD' in st.secrets:
+                saved_ch_password = st.secrets['CLICKHOUSE_PASSWORD']
+        except:
+            pass
+        if not saved_ch_password:
+            saved_ch_password = config.get('clickhouse_password', '') or os.environ.get('CLICKHOUSE_PASSWORD', '') or CLICKHOUSE_CONFIG['password']
+
+        # Default to ClickHouse (always True since we have default password)
         use_clickhouse = st.sidebar.checkbox(
             "Use ClickHouse",
-            value=bool(saved_ch_password),
-            help="Load IPO data from ClickHouse Cloud"
+            value=True,
+            help="Load IPO data from ClickHouse Cloud (recommended)"
         )
         
         if use_clickhouse:
