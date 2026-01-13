@@ -1126,14 +1126,14 @@ def underwriter_opportunities_page():
 
     # Default values (used if no saved config)
     default_filters = {
-        'low_dollar_min': 2.0,
+        'low_dollar_min': 1.0,
         'low_dollar_max': 10.0,
-        'lookback_months': 12,
-        'min_uw_ipos': 3,
-        'min_double_rate': 40,
-        'min_close_to_target': 50,
-        'max_lifetime_gain_idx': 0,  # Index for "100% (no double)"
-        'min_uw_rate_idx': 1,  # Index for "50%"
+        'lookback_months': 24,
+        'min_uw_ipos': 2,
+        'min_double_rate': 30,
+        'min_close_to_target': 80,
+        'max_lifetime_gain_idx': 9,  # Index for "100%"
+        'min_uw_rate_idx': 1,  # Index for "30%"
     }
 
     # Merge saved with defaults
@@ -1189,7 +1189,7 @@ def underwriter_opportunities_page():
 
     close_to_target_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
     max_lifetime_options = ["10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
-    min_uw_rate_options = ["Any", "50%", "75%", "100%"]
+    min_uw_rate_options = ["Any", "30%", "50%", "75%", "100%"]
 
     with col6:
         min_close_to_target = st.select_slider(
@@ -1251,12 +1251,9 @@ def underwriter_opportunities_page():
 
     if min_uw_rate_filter == "Any":
         min_uw_rate_value = 0
-    elif min_uw_rate_filter == "50%":
-        min_uw_rate_value = 50
-    elif min_uw_rate_filter == "75%":
-        min_uw_rate_value = 75
     else:
-        min_uw_rate_value = 100
+        # Extract number from string like "30%" or "50%"
+        min_uw_rate_value = int(min_uw_rate_filter.replace("%", ""))
 
     # ========================================================================
     # CALCULATE METRICS
@@ -1461,14 +1458,14 @@ def main():
         # Check if CSV has newer data than ClickHouse and offer to sync
         check_and_sync_on_startup()
 
-    # Create tabs for different views
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Analysis", "💰 Opportunities", "🆕 Upcoming IPOs", "📈 Statistics & Prediction", "ℹ️ About"])
+    # Create tabs for different views (Opportunities first)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["💰 Opportunities", "📊 Analysis", "🆕 Upcoming IPOs", "📈 Statistics & Prediction", "ℹ️ About"])
 
     with tab1:
-        analysis_page()
+        underwriter_opportunities_page()
 
     with tab2:
-        underwriter_opportunities_page()
+        analysis_page()
 
     with tab3:
         upcoming_ipos_page()
