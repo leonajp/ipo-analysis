@@ -1075,19 +1075,13 @@ def underwriter_opportunities_page():
 
     # Clean up columns
     df_analysis['ipo_price'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
-    df_analysis['lifetime_high_raw'] = pd.to_numeric(df_analysis.get('Lifetime High', df_analysis.get('lifetime_high', 0)), errors='coerce')
     df_analysis['current_price'] = pd.to_numeric(df_analysis.get('last_px_adj', df_analysis.get('current_price', 0)), errors='coerce')
 
-    # Get split factor for adjustment (default to 1 if not available)
-    df_analysis['split_factor'] = pd.to_numeric(df_analysis.get('cum_split_factor_since_base', 1), errors='coerce').fillna(1)
-    df_analysis['split_factor'] = df_analysis['split_factor'].replace(0, 1)  # Avoid division by zero
+    # lifetime_high is now correctly calculated from pq_daily max(high) in ClickHouse
+    # No split adjustment needed - the data is already correct
+    df_analysis['lifetime_high'] = pd.to_numeric(df_analysis.get('Lifetime High', df_analysis.get('lifetime_high', 0)), errors='coerce')
 
-    # Adjust lifetime high for splits (divide by split factor to get adjusted price)
-    # This ensures we compare apples to apples with the IPO price
-    df_analysis['lifetime_high'] = df_analysis['lifetime_high_raw'] / df_analysis['split_factor']
-
-    # Cap lifetime high at reasonable multiple of IPO price to handle bad data
-    # (some tickers have incorrect split factors or unadjusted lifetime highs)
+    # Cap lifetime high at reasonable multiple of IPO price to handle any remaining bad data
     # A 50x gain (5000%) is extremely rare but possible; anything beyond is likely data error
     MAX_REASONABLE_MULTIPLE = 50
     df_analysis['lifetime_high'] = np.minimum(
