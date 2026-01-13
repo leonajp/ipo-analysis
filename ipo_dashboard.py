@@ -19,7 +19,7 @@ Usage:
 """
 
 # VERSION - Update when making changes to verify user has latest code
-DASHBOARD_VERSION = "2.2.0-opportunities"
+DASHBOARD_VERSION = "2.3.0-operations"
 
 import streamlit as st
 import pandas as pd
@@ -308,7 +308,9 @@ def load_from_clickhouse(password: str = None) -> pd.DataFrame:
             'open_px', 'first_5m_high', 'first_5m_low',
             'halted_d1', 'num_halts',
             'sec_filing_type', 'sec_filing_date',
-            'updated_at'
+            'updated_at',
+            # Operation detection columns
+            'operation_count', 'has_operation', 'first_operation_date', 'max_operation_gain'
         ]
         
         # Only query columns that exist
@@ -1132,8 +1134,9 @@ def underwriter_opportunities_page():
         'min_uw_ipos': 2,
         'min_double_rate': 30,
         'min_close_to_target': 80,
-        'max_lifetime_gain_idx': 0,  # Index for "0% (below IPO)" - hasn't pumped at all
+        'max_lifetime_gain_idx': 0,  # Index for "Below IPO price" - hasn't pumped at all
         'min_uw_rate_idx': 1,  # Index for "30%"
+        'operation_filter_idx': 0,  # Index for "No operations" - hasn't been operated
     }
 
     # Merge saved with defaults
@@ -1190,6 +1193,7 @@ def underwriter_opportunities_page():
     close_to_target_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
     max_lifetime_options = ["Below IPO price", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
     min_uw_rate_options = ["Any", "30%", "50%", "75%", "100%"]
+    operation_filter_options = ["No operations", "Any"]
 
     with col6:
         min_close_to_target = st.select_slider(
@@ -1220,6 +1224,17 @@ def underwriter_opportunities_page():
             key="opp_min_uw_rate"
         )
 
+    # Operation filter row
+    col9, col10, col11 = st.columns(3)
+    with col9:
+        operation_filter = st.selectbox(
+            "Operation Status",
+            options=operation_filter_options,
+            index=int(saved_filters.get('operation_filter_idx', 0)),
+            help="Filter by whether IPO has had a volume+price spike (operation). 'No operations' = hasn't been pumped yet.",
+            key="opp_operation_filter"
+        )
+
     # Save as default button
     st.markdown("---")
     col_save, col_reset = st.columns([1, 1])
@@ -1234,6 +1249,7 @@ def underwriter_opportunities_page():
                 'min_close_to_target': min_close_to_target,
                 'max_lifetime_gain_idx': max_lifetime_options.index(max_lifetime_gain),
                 'min_uw_rate_idx': min_uw_rate_options.index(min_uw_rate_filter),
+                'operation_filter_idx': operation_filter_options.index(operation_filter),
             }
             config['opportunity_filters'] = new_filters
             save_config(config)
@@ -1336,9 +1352,22 @@ def underwriter_opportunities_page():
         # Percentage gain filter
         lifetime_filter = low_dollar['lifetime_gain_pct'] < max_lifetime_pct
 
+    # Build operation filter based on user selection
+    if operation_filter == "No operations":
+        # Only show IPOs that haven't had any detected operations (pumps)
+        if 'has_operation' in low_dollar.columns:
+            operation_status_filter = (low_dollar['has_operation'] == 0) | (low_dollar['has_operation'].isna())
+        else:
+            # Fallback if column doesn't exist - use lifetime gain as proxy
+            operation_status_filter = low_dollar['lifetime_gain_pct'] < 50
+    else:
+        # "Any" - no filter
+        operation_status_filter = True
+
     opportunities = low_dollar[
         (low_dollar['underwriter_clean'].isin(high_success_uw)) &
         lifetime_filter &  # Hasn't exceeded max lifetime gain
+        operation_status_filter &  # Operation status filter
         (low_dollar['close_to_target_pct'] >= min_close_to_target) &  # Got close enough to target
         (low_dollar['ipo_date_parsed'] >= cutoff_date) &
         (low_dollar['current_price'].notna()) &
@@ -1373,7 +1402,8 @@ def underwriter_opportunities_page():
         lifetime_filter_text = "Lifetime high < IPO price"
     else:
         lifetime_filter_text = f"Lifetime gain < {max_lifetime_pct}%"
-    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | {lifetime_filter_text} | UW rate ≥ {effective_min_uw_rate}%"
+    operation_filter_text = "No prior operations" if operation_filter == "No operations" else "Any"
+    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | {lifetime_filter_text} | {operation_filter_text} | UW rate ≥ {effective_min_uw_rate}%"
     st.caption(filter_summary)
 
     if len(opportunities) == 0:
@@ -1394,6 +1424,12 @@ def underwriter_opportunities_page():
         display_opps['Upside'] = display_opps['upside_to_double'].apply(lambda x: f"{x:.0f}%")
         display_opps['UW Rate'] = display_opps['double_rate'].apply(lambda x: f"{x:.0f}%")
 
+        # Add operation count if available
+        if 'operation_count' in display_opps.columns:
+            display_opps['Ops'] = display_opps['operation_count'].fillna(0).astype(int)
+        else:
+            display_opps['Ops'] = 0
+
         # Get name column
         name_col = 'Name' if 'Name' in display_opps.columns else 'name'
         if name_col in display_opps.columns:
@@ -1401,8 +1437,11 @@ def underwriter_opportunities_page():
         else:
             display_opps['Company'] = ''
 
+        # Build column list - include Ops if we have operation data
+        display_cols = [ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'Ops', 'UW Rate']
+
         st.dataframe(
-            display_opps[[ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'UW Rate']].rename(columns={
+            display_opps[display_cols].rename(columns={
                 ticker_col: 'Ticker',
                 'underwriter_clean': 'Underwriter'
             }),
@@ -1416,6 +1455,7 @@ def underwriter_opportunities_page():
         - **Life Hi**: Lifetime high price (adjusted for splits, capped at 50x IPO)
         - **Close to 2x**: How close lifetime high got to 2x IPO price (100% = hit double)
         - **Upside**: Potential gain if stock reaches 2x IPO price from current price
+        - **Ops**: Number of detected operations (volume+price spikes)
         - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
         """)
 
