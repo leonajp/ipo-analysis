@@ -1424,11 +1424,67 @@ def underwriter_opportunities_page():
         display_opps['Upside'] = display_opps['upside_to_double'].apply(lambda x: f"{x:.0f}%")
         display_opps['UW Rate'] = display_opps['double_rate'].apply(lambda x: f"{x:.0f}%")
 
-        # Add operation count if available
+        # Add operation count and details if available
         if 'operation_count' in display_opps.columns:
             display_opps['Ops'] = display_opps['operation_count'].fillna(0).astype(int)
         else:
             display_opps['Ops'] = 0
+
+        # Fetch operation details for hover tooltip
+        ops_details = {}
+        if use_ch and ch_pw and HAS_CLICKHOUSE:
+            try:
+                ch_client = clickhouse_connect.get_client(
+                    host=CLICKHOUSE_CONFIG['host'],
+                    port=CLICKHOUSE_CONFIG['port'],
+                    user=CLICKHOUSE_CONFIG['user'],
+                    password=ch_pw,
+                    secure=CLICKHOUSE_CONFIG['secure'],
+                )
+                # Get operation details for tickers in display
+                tickers_list = display_opps[ticker_col].tolist()
+                if tickers_list:
+                    tickers_str = "','".join(tickers_list)
+                    ops_result = ch_client.query(f"""
+                        SELECT
+                            polygon_ticker,
+                            peak_date,
+                            peak_price,
+                            peak_volume,
+                            gain_vs_ipo_pct
+                        FROM market_data.ipo_operations
+                        WHERE polygon_ticker IN ('{tickers_str}')
+                        ORDER BY polygon_ticker, operation_id
+                    """)
+                    # Group by ticker
+                    for row in ops_result.result_rows:
+                        ticker = row[0]
+                        if ticker not in ops_details:
+                            ops_details[ticker] = []
+                        ops_details[ticker].append({
+                            'date': row[1],
+                            'price': row[2],
+                            'volume': row[3],
+                            'gain': row[4]
+                        })
+            except Exception as e:
+                pass  # Silently fail if can't get details
+
+        # Create operation tooltip text (compact format for hover)
+        def format_ops_tooltip(ticker, ops_count):
+            if ops_count == 0 or ticker not in ops_details:
+                return str(int(ops_count))
+            details = ops_details[ticker]
+            # Format: "2 | 10/21: $11.43 +186% | 10/28: $6.78 +70%"
+            parts = [str(int(ops_count))]
+            for op in details[:3]:  # Max 3 operations to keep it readable
+                date_str = str(op['date'])[5:10].replace('-', '/')  # MM/DD format
+                parts.append(f"{date_str}: ${op['price']:.2f} +{op['gain']:.0f}%")
+            return " | ".join(parts)
+
+        display_opps['Ops_tooltip'] = display_opps.apply(
+            lambda row: format_ops_tooltip(row[ticker_col], row['Ops']), axis=1
+        )
 
         # Get name column
         name_col = 'Name' if 'Name' in display_opps.columns else 'name'
@@ -1437,16 +1493,24 @@ def underwriter_opportunities_page():
         else:
             display_opps['Company'] = ''
 
-        # Build column list - include Ops if we have operation data
-        display_cols = [ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'Ops', 'UW Rate']
+        # Build column list - use Ops_tooltip instead of Ops for hover details
+        display_cols = [ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'Ops_tooltip', 'UW Rate']
 
         st.dataframe(
             display_opps[display_cols].rename(columns={
                 ticker_col: 'Ticker',
-                'underwriter_clean': 'Underwriter'
+                'underwriter_clean': 'Underwriter',
+                'Ops_tooltip': 'Ops'
             }),
             width="stretch",
-            hide_index=True
+            hide_index=True,
+            column_config={
+                "Ops": st.column_config.TextColumn(
+                    "Ops",
+                    help="Number of detected operations (volume+price spikes). Hover over cell for details.",
+                    width="small"
+                )
+            }
         )
 
         # Legend
@@ -1455,7 +1519,7 @@ def underwriter_opportunities_page():
         - **Life Hi**: Lifetime high price (adjusted for splits, capped at 50x IPO)
         - **Close to 2x**: How close lifetime high got to 2x IPO price (100% = hit double)
         - **Upside**: Potential gain if stock reaches 2x IPO price from current price
-        - **Ops**: Number of detected operations (volume+price spikes)
+        - **Ops**: Operations detected (format: `count | date: $price +gain%`). Operation = volume spike (>5x median) + price >50% above IPO
         - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
         """)
 
