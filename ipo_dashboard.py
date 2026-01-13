@@ -358,6 +358,8 @@ def load_from_clickhouse(password: str = None) -> pd.DataFrame:
             'halted_d1', 'num_halts',
             'sec_filing_type', 'sec_filing_date',
             'updated_at',
+            # Current price columns
+            'last_price_adj', 'last_price_unadj', 'split_factor',
             # Operation detection columns
             'operation_count', 'has_operation', 'first_operation_date', 'max_operation_gain'
         ]
@@ -1124,7 +1126,11 @@ def underwriter_opportunities_page():
 
     # Clean up columns
     df_analysis['ipo_price'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
-    df_analysis['current_price'] = pd.to_numeric(df_analysis.get('last_px_adj', df_analysis.get('current_price', 0)), errors='coerce')
+    # Get current price - try last_price_adj first (ClickHouse), then last_px_adj, then current_price
+    df_analysis['current_price'] = pd.to_numeric(
+        df_analysis.get('last_price_adj', df_analysis.get('last_px_adj', df_analysis.get('current_price', 0))),
+        errors='coerce'
+    )
 
     # lifetime_high is now correctly calculated from pq_daily max(high) in ClickHouse
     # No split adjustment needed - the data is already correct
