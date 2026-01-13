@@ -1116,24 +1116,70 @@ def underwriter_opportunities_page():
         ticker_col = 'ticker_clean'
 
     # ========================================================================
-    # FILTERS
+    # FILTERS (with saved defaults)
     # ========================================================================
     st.subheader("🔧 Filters")
+
+    # Load saved filter defaults
+    config = load_config()
+    saved_filters = config.get('opportunity_filters', {})
+
+    # Default values (used if no saved config)
+    default_filters = {
+        'low_dollar_min': 2.0,
+        'low_dollar_max': 10.0,
+        'lookback_months': 12,
+        'min_uw_ipos': 3,
+        'min_double_rate': 40,
+        'min_close_to_target': 50,
+        'max_lifetime_gain_idx': 0,  # Index for "100% (no double)"
+        'min_uw_rate_idx': 1,  # Index for "50%"
+    }
+
+    # Merge saved with defaults
+    for key, default_val in default_filters.items():
+        if key not in saved_filters:
+            saved_filters[key] = default_val
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        low_dollar_min = st.number_input("Min IPO Price ($)", value=2.0, min_value=0.0, max_value=50.0, step=0.5)
+        low_dollar_min = st.number_input(
+            "Min IPO Price ($)",
+            value=float(saved_filters['low_dollar_min']),
+            min_value=0.0, max_value=50.0, step=0.5,
+            key="opp_low_dollar_min"
+        )
     with col2:
-        low_dollar_max = st.number_input("Max IPO Price ($)", value=10.0, min_value=0.0, max_value=100.0, step=1.0)
+        low_dollar_max = st.number_input(
+            "Max IPO Price ($)",
+            value=float(saved_filters['low_dollar_max']),
+            min_value=0.0, max_value=100.0, step=1.0,
+            key="opp_low_dollar_max"
+        )
     with col3:
-        lookback_months = st.slider("Lookback Period (months)", 6, 24, 12)
+        lookback_months = st.slider(
+            "Lookback Period (months)",
+            6, 24,
+            value=int(saved_filters['lookback_months']),
+            key="opp_lookback"
+        )
 
     col4, col5 = st.columns(2)
     with col4:
-        min_uw_ipos = st.slider("Min IPOs per Underwriter", 2, 10, 3)
+        min_uw_ipos = st.slider(
+            "Min IPOs per Underwriter",
+            2, 10,
+            value=int(saved_filters['min_uw_ipos']),
+            key="opp_min_uw_ipos"
+        )
     with col5:
-        min_double_rate = st.slider("Min Double Rate (%)", 0, 100, 40)
+        min_double_rate = st.slider(
+            "Min Double Rate (%)",
+            0, 100,
+            value=int(saved_filters['min_double_rate']),
+            key="opp_min_double_rate"
+        )
 
     # Opportunity filters
     st.markdown("---")
@@ -1141,27 +1187,56 @@ def underwriter_opportunities_page():
 
     col6, col7, col8 = st.columns(3)
 
+    close_to_target_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+    max_lifetime_options = ["100% (no double)", "150%", "200%", "Any"]
+    min_uw_rate_options = ["Any", "50%", "75%", "100%"]
+
     with col6:
         min_close_to_target = st.select_slider(
             "Min 'Close to Target' %",
-            options=[10, 20, 30, 40, 50, 60, 70, 80, 90],
-            value=50,
-            help="Minimum % progress toward the target (e.g., 50% = halfway to target)"
+            options=close_to_target_options,
+            value=int(saved_filters['min_close_to_target']),
+            help="Minimum % progress toward the target (e.g., 50% = halfway to target)",
+            key="opp_min_close"
         )
     with col7:
         max_lifetime_gain = st.selectbox(
             "Max Lifetime High vs IPO",
-            options=["100% (no double)", "150%", "200%", "Any"],
-            index=0,
-            help="Filter for IPOs that haven't exceeded this gain yet"
+            options=max_lifetime_options,
+            index=int(saved_filters['max_lifetime_gain_idx']),
+            help="Filter for IPOs that haven't exceeded this gain yet",
+            key="opp_max_lifetime"
         )
     with col8:
         min_uw_rate_filter = st.selectbox(
             "Min Underwriter Success Rate",
-            options=["Any", "50%", "75%", "100%"],
-            index=1,
-            help="Only show IPOs from underwriters with this historical double rate"
+            options=min_uw_rate_options,
+            index=int(saved_filters['min_uw_rate_idx']),
+            help="Only show IPOs from underwriters with this historical double rate",
+            key="opp_min_uw_rate"
         )
+
+    # Save as default button
+    st.markdown("---")
+    col_save, col_reset = st.columns([1, 1])
+    with col_save:
+        if st.button("💾 Save as Default", key="save_opp_filters", help="Save current filters as your default"):
+            new_filters = {
+                'low_dollar_min': low_dollar_min,
+                'low_dollar_max': low_dollar_max,
+                'lookback_months': lookback_months,
+                'min_uw_ipos': min_uw_ipos,
+                'min_double_rate': min_double_rate,
+                'min_close_to_target': min_close_to_target,
+                'max_lifetime_gain_idx': max_lifetime_options.index(max_lifetime_gain),
+                'min_uw_rate_idx': min_uw_rate_options.index(min_uw_rate_filter),
+            }
+            config['opportunity_filters'] = new_filters
+            save_config(config)
+            st.success("✅ Filters saved as default!")
+    with col_reset:
+        if st.button("🔄 Reset to Default", key="reset_opp_filters", help="Reset filters to saved defaults"):
+            st.rerun()
 
     # Parse filter values
     if max_lifetime_gain == "100% (no double)":
