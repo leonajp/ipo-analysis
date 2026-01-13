@@ -1132,7 +1132,7 @@ def underwriter_opportunities_page():
         'min_uw_ipos': 2,
         'min_double_rate': 30,
         'min_close_to_target': 80,
-        'max_lifetime_gain_idx': 9,  # Index for "100%"
+        'max_lifetime_gain_idx': 0,  # Index for "0% (below IPO)" - hasn't pumped at all
         'min_uw_rate_idx': 1,  # Index for "30%"
     }
 
@@ -1188,7 +1188,7 @@ def underwriter_opportunities_page():
     col6, col7, col8 = st.columns(3)
 
     close_to_target_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
-    max_lifetime_options = ["10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
+    max_lifetime_options = ["0% (below IPO)", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
     min_uw_rate_options = ["Any", "30%", "50%", "75%", "100%"]
 
     with col6:
@@ -1245,6 +1245,8 @@ def underwriter_opportunities_page():
     # Parse filter values
     if max_lifetime_gain == "Any":
         max_lifetime_pct = 10000  # Effectively no limit
+    elif max_lifetime_gain == "0% (below IPO)":
+        max_lifetime_pct = 0  # Lifetime high must be below IPO price
     else:
         # Extract number from string like "50%" or "100%"
         max_lifetime_pct = int(max_lifetime_gain.replace("%", ""))
@@ -1284,10 +1286,8 @@ def underwriter_opportunities_page():
     )
 
     # ========================================================================
-    # UNDERWRITER STATISTICS
+    # CALCULATE UNDERWRITER STATISTICS (needed for opportunities)
     # ========================================================================
-    st.subheader("📊 Underwriter Performance (Low Dollar IPOs)")
-
     uw_stats = low_dollar.groupby('underwriter_clean').agg(
         total_ipos=(ticker_col, 'count'),
         doubled_count=('hit_double', 'sum'),
@@ -1298,27 +1298,8 @@ def underwriter_opportunities_page():
     uw_stats['double_rate'] = (uw_stats['doubled_count'] / uw_stats['total_ipos']) * 100
     uw_stats = uw_stats[uw_stats['total_ipos'] >= min_uw_ipos].sort_values('double_rate', ascending=False)
 
-    # Display top underwriters
-    st.markdown(f"**Top Underwriters by Double Rate** (min {min_uw_ipos} IPOs)")
-
-    display_uw = uw_stats.head(15).copy()
-    display_uw['Double Rate'] = display_uw['double_rate'].apply(lambda x: f"{x:.1f}%")
-    # Use median for display (more robust against outliers)
-    display_uw['Median Max Gain'] = display_uw['median_max_gain'].apply(lambda x: f"{x:.0f}%")
-    display_uw = display_uw.rename(columns={
-        'underwriter_clean': 'Underwriter',
-        'total_ipos': 'Total IPOs',
-        'doubled_count': 'Doubled'
-    })
-
-    st.dataframe(
-        display_uw[['Underwriter', 'Total IPOs', 'Doubled', 'Double Rate', 'Median Max Gain']],
-        width="stretch",
-        hide_index=True
-    )
-
     # ========================================================================
-    # OPPORTUNITIES TABLE
+    # OPPORTUNITIES TABLE (displayed first)
     # ========================================================================
     st.subheader("🎯 Buying Opportunities")
     st.markdown(f"*Recent IPOs from high-success underwriters matching your criteria*")
@@ -1423,6 +1404,27 @@ def underwriter_opportunities_page():
         - **Upside**: Potential gain if stock reaches 2x IPO price from current price
         - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
         """)
+
+    # ========================================================================
+    # UNDERWRITER STATISTICS (displayed after opportunities)
+    # ========================================================================
+    st.subheader("📊 Underwriter Performance (Low Dollar IPOs)")
+    st.markdown(f"**Top Underwriters by Double Rate** (min {min_uw_ipos} IPOs)")
+
+    display_uw = uw_stats.head(15).copy()
+    display_uw['Double Rate'] = display_uw['double_rate'].apply(lambda x: f"{x:.1f}%")
+    display_uw['Median Max Gain'] = display_uw['median_max_gain'].apply(lambda x: f"{x:.0f}%")
+    display_uw = display_uw.rename(columns={
+        'underwriter_clean': 'Underwriter',
+        'total_ipos': 'Total IPOs',
+        'doubled_count': 'Doubled'
+    })
+
+    st.dataframe(
+        display_uw[['Underwriter', 'Total IPOs', 'Doubled', 'Double Rate', 'Median Max Gain']],
+        width="stretch",
+        hide_index=True
+    )
 
     # ========================================================================
     # KNOWN OPERATION UNDERWRITERS
