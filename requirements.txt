@@ -17,8 +17,8 @@ streamlit>=1.28.0
 polygon-api-client>=1.12.0  # Polygon.io market data
 requests>=2.31.0
 
-# Optional: ClickHouse integration
-# clickhouse-connect>=0.6.0
+# ClickHouse integration
+clickhouse-connect>=0.6.0
 
 # Optional: SEC S-1 Parser
 beautifulsoup4>=4.12.0
