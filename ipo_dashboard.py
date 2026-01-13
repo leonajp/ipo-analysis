@@ -1188,7 +1188,7 @@ def underwriter_opportunities_page():
     col6, col7, col8 = st.columns(3)
 
     close_to_target_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
-    max_lifetime_options = ["0% (below IPO)", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
+    max_lifetime_options = ["Below IPO price", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
     min_uw_rate_options = ["Any", "30%", "50%", "75%", "100%"]
 
     with col6:
@@ -1243,10 +1243,12 @@ def underwriter_opportunities_page():
             st.rerun()
 
     # Parse filter values
+    filter_below_ipo = False  # Special flag for "below IPO price" filter
     if max_lifetime_gain == "Any":
         max_lifetime_pct = 10000  # Effectively no limit
-    elif max_lifetime_gain == "0% (below IPO)":
-        max_lifetime_pct = 0  # Lifetime high must be below IPO price
+    elif max_lifetime_gain == "Below IPO price":
+        filter_below_ipo = True  # Will filter for lifetime_high < ipo_price directly
+        max_lifetime_pct = None  # Not used when filter_below_ipo is True
     else:
         # Extract number from string like "50%" or "100%"
         max_lifetime_pct = int(max_lifetime_gain.replace("%", ""))
@@ -1326,9 +1328,17 @@ def underwriter_opportunities_page():
     )
 
     # Apply all filters
+    # Build lifetime high filter based on user selection
+    if filter_below_ipo:
+        # Direct comparison: lifetime high must be below IPO price
+        lifetime_filter = low_dollar['lifetime_high'] < low_dollar['ipo_price']
+    else:
+        # Percentage gain filter
+        lifetime_filter = low_dollar['lifetime_gain_pct'] < max_lifetime_pct
+
     opportunities = low_dollar[
         (low_dollar['underwriter_clean'].isin(high_success_uw)) &
-        (low_dollar['lifetime_gain_pct'] < max_lifetime_pct) &  # Hasn't exceeded max lifetime gain
+        lifetime_filter &  # Hasn't exceeded max lifetime gain
         (low_dollar['close_to_target_pct'] >= min_close_to_target) &  # Got close enough to target
         (low_dollar['ipo_date_parsed'] >= cutoff_date) &
         (low_dollar['current_price'].notna()) &
@@ -1359,7 +1369,11 @@ def underwriter_opportunities_page():
     opportunities = opportunities.sort_values('opp_score', ascending=False)
 
     # Show active filter summary
-    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | Lifetime gain < {max_lifetime_pct}% | UW rate ≥ {effective_min_uw_rate}%"
+    if filter_below_ipo:
+        lifetime_filter_text = "Lifetime high < IPO price"
+    else:
+        lifetime_filter_text = f"Lifetime gain < {max_lifetime_pct}%"
+    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | {lifetime_filter_text} | UW rate ≥ {effective_min_uw_rate}%"
     st.caption(filter_summary)
 
     if len(opportunities) == 0:
