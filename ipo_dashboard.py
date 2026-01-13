@@ -56,7 +56,7 @@ CLICKHOUSE_CONFIG = {
     'host': os.environ.get('CLICKHOUSE_HOST', 'i35q8zrtq4.us-east-2.aws.clickhouse.cloud'),
     'port': int(os.environ.get('CLICKHOUSE_PORT', '443')),
     'user': os.environ.get('CLICKHOUSE_USER', 'default'),
-    'password': os.environ.get('CLICKHOUSE_PASSWORD', '~AiDc7hJ7m1Bv'),
+    'password': os.environ.get('CLICKHOUSE_PASSWORD', ''),
     'database': os.environ.get('CLICKHOUSE_DATABASE', 'ipo'),
     'table': os.environ.get('CLICKHOUSE_TABLE', 'ipo_master'),
     'secure': True,
@@ -96,6 +96,55 @@ def save_config(config: dict):
             json.dump(config, f)
     except Exception as e:
         pass  # Silently fail on cloud
+
+def get_clickhouse_password() -> str:
+    """Get ClickHouse password from various sources (priority order)."""
+    # 1. Check session state (user just entered it)
+    if st.session_state.get('clickhouse_password'):
+        return st.session_state.clickhouse_password
+
+    # 2. Check Streamlit secrets (for cloud deployment)
+    try:
+        if hasattr(st, 'secrets') and 'CLICKHOUSE_PASSWORD' in st.secrets:
+            return st.secrets['CLICKHOUSE_PASSWORD']
+    except Exception:
+        pass
+
+    # 3. Check environment variable
+    if os.environ.get('CLICKHOUSE_PASSWORD'):
+        return os.environ['CLICKHOUSE_PASSWORD']
+
+    # 4. Check saved config file (local persistence)
+    config = load_config()
+    if config.get('clickhouse_password'):
+        return config['clickhouse_password']
+
+    return ''
+
+def save_clickhouse_password(password: str):
+    """Save ClickHouse password to storage."""
+    if password:
+        # Save to session state
+        st.session_state.clickhouse_password = password
+
+        # Save to local config file
+        try:
+            config = load_config()
+            config['clickhouse_password'] = password
+            save_config(config)
+        except Exception:
+            pass
+
+def clear_clickhouse_password():
+    """Clear ClickHouse password from all storage locations."""
+    st.session_state.clickhouse_password = ''
+
+    try:
+        config = load_config()
+        config.pop('clickhouse_password', None)
+        save_config(config)
+    except Exception:
+        pass
 
 def inject_local_storage_js():
     """Inject JavaScript for browser localStorage access."""
@@ -2283,6 +2332,8 @@ def analysis_page():
         st.session_state.detailed_ipo = None
     if 'polygon_api_key' not in st.session_state:
         st.session_state.polygon_api_key = get_polygon_api_key()
+    if 'clickhouse_password' not in st.session_state:
+        st.session_state.clickhouse_password = get_clickhouse_password()
     
     # ========================================================================
     # SIDEBAR - Define before data loading (Streamlit renders in order)
@@ -2294,40 +2345,33 @@ def analysis_page():
     # DATA SOURCE - ClickHouse or CSV fallback
     # ========================================================================
     st.sidebar.subheader("🗄️ Data Source")
-    
+
     use_clickhouse = False
     ch_password = None
-    
+
     if not HAS_CLICKHOUSE:
         st.sidebar.warning("Install: `pip install clickhouse-connect`")
         st.sidebar.caption("📁 Using CSV fallback")
     else:
-        config = load_config()
-        # Check for password in: 1) Streamlit secrets, 2) saved config, 3) environment variable, 4) default config
-        saved_ch_password = ''
-        try:
-            if hasattr(st, 'secrets') and 'CLICKHOUSE_PASSWORD' in st.secrets:
-                saved_ch_password = st.secrets['CLICKHOUSE_PASSWORD']
-        except:
-            pass
-        if not saved_ch_password:
-            saved_ch_password = config.get('clickhouse_password', '') or os.environ.get('CLICKHOUSE_PASSWORD', '') or CLICKHOUSE_CONFIG['password']
+        # Get saved password using helper function
+        saved_ch_password = get_clickhouse_password()
 
-        # Default to ClickHouse (always True since we have default password)
-        use_clickhouse = st.sidebar.checkbox(
-            "Use ClickHouse",
-            value=True,
-            help="Load IPO data from ClickHouse Cloud (recommended)"
-        )
-        
-        if use_clickhouse:
-            if saved_ch_password:
+        if saved_ch_password:
+            # Password exists - default to ClickHouse
+            use_clickhouse = st.sidebar.checkbox(
+                "Use ClickHouse",
+                value=True,
+                help="Load IPO data from ClickHouse Cloud (recommended for latest data)"
+            )
+
+            if use_clickhouse:
                 ch_password = saved_ch_password
-                
+                st.sidebar.success("✅ Using ClickHouse")
+
                 # Password management in expander
                 with st.sidebar.expander("⚙️ ClickHouse Settings"):
                     st.caption(f"Host: {CLICKHOUSE_CONFIG['host'][:30]}...")
-                    
+
                     new_password = st.text_input(
                         "Password",
                         value=saved_ch_password,
@@ -2335,35 +2379,43 @@ def analysis_page():
                         key="ch_password_input"
                     )
                     if new_password != saved_ch_password:
-                        config['clickhouse_password'] = new_password
-                        save_config(config)
+                        save_clickhouse_password(new_password)
                         st.success("✅ Password updated!")
                         st.rerun()
-                    
+
                     if st.button("🗑️ Clear Password", key="clear_ch_btn"):
-                        config.pop('clickhouse_password', None)
-                        save_config(config)
+                        clear_clickhouse_password()
                         st.rerun()
-                
+
                 # Reload button
                 if st.sidebar.button("🔄 Reload Data", key="reload_ch_btn"):
                     st.cache_data.clear()
                     st.rerun()
             else:
-                st.sidebar.info("Enter ClickHouse password")
-                ch_password = st.sidebar.text_input(
-                    "Password",
-                    value='',
-                    type="password",
-                    key="ch_password_new"
-                )
-                if ch_password:
-                    config['clickhouse_password'] = ch_password
-                    save_config(config)
-                    st.sidebar.success("✅ Password saved!")
-                    st.rerun()
+                st.sidebar.caption("📁 Using CSV file")
         else:
-            st.sidebar.caption("📁 Using CSV file")
+            # No password - show input form
+            st.sidebar.info("💡 Enter ClickHouse password for latest data")
+
+            ch_password_input = st.sidebar.text_input(
+                "ClickHouse Password",
+                value='',
+                type="password",
+                key="ch_password_new",
+                help="Enter password to connect to ClickHouse Cloud"
+            )
+
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                if st.button("💾 Save", key="save_ch_btn"):
+                    if ch_password_input:
+                        save_clickhouse_password(ch_password_input)
+                        st.sidebar.success("✅ Password saved!")
+                        st.rerun()
+                    else:
+                        st.sidebar.error("Please enter a password")
+
+            st.sidebar.caption("📁 Currently using CSV fallback")
     
     # Polygon API key section
     st.sidebar.markdown("---")
