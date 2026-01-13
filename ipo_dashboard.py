@@ -1118,6 +1118,8 @@ def underwriter_opportunities_page():
     # ========================================================================
     # FILTERS
     # ========================================================================
+    st.subheader("🔧 Filters")
+
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -1132,6 +1134,53 @@ def underwriter_opportunities_page():
         min_uw_ipos = st.slider("Min IPOs per Underwriter", 2, 10, 3)
     with col5:
         min_double_rate = st.slider("Min Double Rate (%)", 0, 100, 40)
+
+    # Opportunity filters
+    st.markdown("---")
+    st.markdown("**🎯 Opportunity Criteria** - Find IPOs that got close to target but haven't reached it yet")
+
+    col6, col7, col8 = st.columns(3)
+
+    with col6:
+        min_close_to_target = st.select_slider(
+            "Min 'Close to Target' %",
+            options=[10, 20, 30, 40, 50, 60, 70, 80, 90],
+            value=50,
+            help="Minimum % progress toward the target (e.g., 50% = halfway to target)"
+        )
+    with col7:
+        max_lifetime_gain = st.selectbox(
+            "Max Lifetime High vs IPO",
+            options=["100% (no double)", "150%", "200%", "Any"],
+            index=0,
+            help="Filter for IPOs that haven't exceeded this gain yet"
+        )
+    with col8:
+        min_uw_rate_filter = st.selectbox(
+            "Min Underwriter Success Rate",
+            options=["Any", "50%", "75%", "100%"],
+            index=1,
+            help="Only show IPOs from underwriters with this historical double rate"
+        )
+
+    # Parse filter values
+    if max_lifetime_gain == "100% (no double)":
+        max_lifetime_pct = 100
+    elif max_lifetime_gain == "150%":
+        max_lifetime_pct = 150
+    elif max_lifetime_gain == "200%":
+        max_lifetime_pct = 200
+    else:
+        max_lifetime_pct = 10000  # Effectively no limit
+
+    if min_uw_rate_filter == "Any":
+        min_uw_rate_value = 0
+    elif min_uw_rate_filter == "50%":
+        min_uw_rate_value = 50
+    elif min_uw_rate_filter == "75%":
+        min_uw_rate_value = 75
+    else:
+        min_uw_rate_value = 100
 
     # ========================================================================
     # CALCULATE METRICS
@@ -1199,17 +1248,34 @@ def underwriter_opportunities_page():
     # OPPORTUNITIES TABLE
     # ========================================================================
     st.subheader("🎯 Buying Opportunities")
-    st.markdown(f"*Recent IPOs from high-success underwriters that haven't doubled yet*")
+    st.markdown(f"*Recent IPOs from high-success underwriters matching your criteria*")
 
     # Filter for recent IPOs that haven't doubled
     cutoff_date = datetime.now() - timedelta(days=lookback_months * 30)
 
-    # Get high success underwriters
-    high_success_uw = uw_stats[uw_stats['double_rate'] >= min_double_rate]['underwriter_clean'].tolist()
+    # Get high success underwriters (using the stricter of min_double_rate and min_uw_rate_value)
+    effective_min_uw_rate = max(min_double_rate, min_uw_rate_value)
+    high_success_uw = uw_stats[uw_stats['double_rate'] >= effective_min_uw_rate]['underwriter_clean'].tolist()
 
+    # Calculate lifetime gain % for filtering
+    low_dollar['lifetime_gain_pct'] = np.where(
+        low_dollar['ipo_price'] > 0,
+        ((low_dollar['lifetime_high'] - low_dollar['ipo_price']) / low_dollar['ipo_price']) * 100,
+        0
+    )
+
+    # Calculate close to target % (using 2x as target)
+    low_dollar['close_to_target_pct'] = np.where(
+        low_dollar['ipo_price'] > 0,
+        (low_dollar['lifetime_high'] / (low_dollar['ipo_price'] * 2)) * 100,
+        0
+    )
+
+    # Apply all filters
     opportunities = low_dollar[
         (low_dollar['underwriter_clean'].isin(high_success_uw)) &
-        (low_dollar['hit_double'] == False) &
+        (low_dollar['lifetime_gain_pct'] < max_lifetime_pct) &  # Hasn't exceeded max lifetime gain
+        (low_dollar['close_to_target_pct'] >= min_close_to_target) &  # Got close enough to target
         (low_dollar['ipo_date_parsed'] >= cutoff_date) &
         (low_dollar['current_price'].notna()) &
         (low_dollar['current_price'] > 0)
@@ -1223,11 +1289,7 @@ def underwriter_opportunities_page():
     )
 
     # Calculate opportunity metrics
-    opportunities['close_to_double_pct'] = np.where(
-        opportunities['ipo_price'] > 0,
-        (opportunities['lifetime_high'] / (opportunities['ipo_price'] * 2)) * 100,
-        0
-    )
+    opportunities['close_to_double_pct'] = opportunities['close_to_target_pct']
     opportunities['upside_to_double'] = np.where(
         opportunities['current_price'] > 0,
         ((opportunities['ipo_price'] * 2 - opportunities['current_price']) / opportunities['current_price']) * 100,
@@ -1241,6 +1303,10 @@ def underwriter_opportunities_page():
         opportunities['upside_to_double'].clip(0, 300) * 0.3
     )
     opportunities = opportunities.sort_values('opp_score', ascending=False)
+
+    # Show active filter summary
+    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | Lifetime gain < {max_lifetime_pct}% | UW rate ≥ {effective_min_uw_rate}%"
+    st.caption(filter_summary)
 
     if len(opportunities) == 0:
         st.info("No opportunities found matching current filters. Try adjusting the parameters.")
