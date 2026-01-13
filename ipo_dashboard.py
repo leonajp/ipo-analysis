@@ -1183,12 +1183,12 @@ def underwriter_opportunities_page():
 
     # Opportunity filters
     st.markdown("---")
-    st.markdown("**🎯 Opportunity Criteria** - Find IPOs that got close to target but haven't reached it yet")
+    st.markdown("**🎯 Opportunity Criteria** - Find IPOs that haven't been 'operated' (pumped) yet")
 
     col6, col7, col8 = st.columns(3)
 
     close_to_target_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
-    max_lifetime_options = ["100% (no double)", "150%", "200%", "Any"]
+    max_lifetime_options = ["10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
     min_uw_rate_options = ["Any", "50%", "75%", "100%"]
 
     with col6:
@@ -1196,15 +1196,19 @@ def underwriter_opportunities_page():
             "Min 'Close to Target' %",
             options=close_to_target_options,
             value=int(saved_filters['min_close_to_target']),
-            help="Minimum % progress toward the target (e.g., 50% = halfway to target)",
+            help="Minimum % progress toward the target (e.g., 50% = halfway to 2x)",
             key="opp_min_close"
         )
     with col7:
+        # Handle legacy saved index that may be out of range
+        saved_max_idx = int(saved_filters.get('max_lifetime_gain_idx', 9))
+        if saved_max_idx >= len(max_lifetime_options):
+            saved_max_idx = 9  # Default to 100%
         max_lifetime_gain = st.selectbox(
-            "Max Lifetime High vs IPO",
+            "Max Lifetime Gain (no pump)",
             options=max_lifetime_options,
-            index=int(saved_filters['max_lifetime_gain_idx']),
-            help="Filter for IPOs that haven't exceeded this gain yet",
+            index=saved_max_idx,
+            help="Filter out IPOs that already pumped. Lower = hasn't run yet (e.g., 50% = never gained more than 50%)",
             key="opp_max_lifetime"
         )
     with col8:
@@ -1239,14 +1243,11 @@ def underwriter_opportunities_page():
             st.rerun()
 
     # Parse filter values
-    if max_lifetime_gain == "100% (no double)":
-        max_lifetime_pct = 100
-    elif max_lifetime_gain == "150%":
-        max_lifetime_pct = 150
-    elif max_lifetime_gain == "200%":
-        max_lifetime_pct = 200
-    else:
+    if max_lifetime_gain == "Any":
         max_lifetime_pct = 10000  # Effectively no limit
+    else:
+        # Extract number from string like "50%" or "100%"
+        max_lifetime_pct = int(max_lifetime_gain.replace("%", ""))
 
     if min_uw_rate_filter == "Any":
         min_uw_rate_value = 0
