@@ -965,7 +965,10 @@ def underwriter_opportunities_page():
     df_analysis['ipo_price_original'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
 
     # Get split factor for adjusting IPO price (default to 1 if not available)
-    df_analysis['split_factor'] = pd.to_numeric(df_analysis.get('split_factor', 1), errors='coerce').fillna(1)
+    if 'split_factor' in df_analysis.columns:
+        df_analysis['split_factor'] = pd.to_numeric(df_analysis['split_factor'], errors='coerce').fillna(1)
+    else:
+        df_analysis['split_factor'] = 1.0
     # Replace 0 with 1 to avoid division issues
     df_analysis.loc[df_analysis['split_factor'] == 0, 'split_factor'] = 1
 
