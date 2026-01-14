@@ -1299,13 +1299,20 @@ def underwriter_opportunities_page():
         operation_status_filter = True
 
     # Build underwriter filter - optionally include IPOs without underwriter data
+    # Get list of underwriters with sufficient IPO history (in uw_stats)
+    underwriters_with_history = uw_stats['underwriter_clean'].tolist()
+
     if include_no_uw:
-        # Include IPOs with high-success underwriters OR no underwriter data
+        # Include IPOs with high-success underwriters OR no underwriter data OR
+        # underwriters with insufficient IPO history (new underwriters like RBW Capital Partners)
         uw_filter = (
             (low_dollar['underwriter_clean'].isin(high_success_uw)) |
             (low_dollar['underwriter_clean'].isna()) |
             (low_dollar['underwriter_clean'] == '') |
-            (low_dollar['underwriter_clean'] == 'Unknown')
+            (low_dollar['underwriter_clean'] == 'Unknown') |
+            (~low_dollar['underwriter_clean'].isin(underwriters_with_history) &
+             low_dollar['underwriter_clean'].notna() &
+             (low_dollar['underwriter_clean'] != ''))
         )
     else:
         # Only include IPOs with high-success underwriters
