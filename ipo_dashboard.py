@@ -1058,10 +1058,11 @@ def underwriter_opportunities_page():
         'lookback_months': 24,
         'min_uw_ipos': 2,
         'min_double_rate': 30,
-        'min_close_to_target': 80,
+        'min_close_to_target': 50,  # Lowered from 80 to be more inclusive
         'max_lifetime_gain_idx': 0,  # Index for "Below IPO price" - hasn't pumped at all
-        'min_uw_rate_idx': 1,  # Index for "30%"
+        'min_uw_rate_idx': 0,  # Index for "Any" - don't require high success underwriter
         'operation_filter_idx': 0,  # Index for "No operations" - hasn't been operated
+        'include_no_uw': True,  # Include IPOs without underwriter data
     }
 
     # Merge saved with defaults
@@ -1159,6 +1160,13 @@ def underwriter_opportunities_page():
             help="Filter by whether IPO has had a volume+price spike (operation). 'No operations' = hasn't been pumped yet.",
             key="opp_operation_filter"
         )
+    with col10:
+        include_no_uw = st.checkbox(
+            "Include IPOs without underwriter",
+            value=bool(saved_filters.get('include_no_uw', True)),
+            help="Include recent IPOs that don't have underwriter data yet (common for brand new IPOs)",
+            key="opp_include_no_uw"
+        )
 
     # Save as default button
     st.markdown("---")
@@ -1175,6 +1183,7 @@ def underwriter_opportunities_page():
                 'max_lifetime_gain_idx': max_lifetime_options.index(max_lifetime_gain),
                 'min_uw_rate_idx': min_uw_rate_options.index(min_uw_rate_filter),
                 'operation_filter_idx': operation_filter_options.index(operation_filter),
+                'include_no_uw': include_no_uw,
             }
             config['opportunity_filters'] = new_filters
             save_config(config)
@@ -1289,8 +1298,21 @@ def underwriter_opportunities_page():
         # "Any" - no filter
         operation_status_filter = True
 
+    # Build underwriter filter - optionally include IPOs without underwriter data
+    if include_no_uw:
+        # Include IPOs with high-success underwriters OR no underwriter data
+        uw_filter = (
+            (low_dollar['underwriter_clean'].isin(high_success_uw)) |
+            (low_dollar['underwriter_clean'].isna()) |
+            (low_dollar['underwriter_clean'] == '') |
+            (low_dollar['underwriter_clean'] == 'Unknown')
+        )
+    else:
+        # Only include IPOs with high-success underwriters
+        uw_filter = low_dollar['underwriter_clean'].isin(high_success_uw)
+
     opportunities = low_dollar[
-        (low_dollar['underwriter_clean'].isin(high_success_uw)) &
+        uw_filter &
         lifetime_filter &  # Hasn't exceeded max lifetime gain
         operation_status_filter &  # Operation status filter
         (low_dollar['close_to_target_pct'] >= min_close_to_target) &  # Got close enough to target
@@ -1328,7 +1350,10 @@ def underwriter_opportunities_page():
     else:
         lifetime_filter_text = f"Lifetime gain < {max_lifetime_pct}%"
     operation_filter_text = "No prior operations" if operation_filter == "No operations" else "Any"
-    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | {lifetime_filter_text} | {operation_filter_text} | UW rate ≥ {effective_min_uw_rate}%"
+    uw_filter_text = f"UW rate ≥ {effective_min_uw_rate}%" if effective_min_uw_rate > 0 else "Any UW"
+    if include_no_uw:
+        uw_filter_text += " (incl. no UW)"
+    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | {lifetime_filter_text} | {operation_filter_text} | {uw_filter_text}"
     st.caption(filter_summary)
 
     if len(opportunities) == 0:
