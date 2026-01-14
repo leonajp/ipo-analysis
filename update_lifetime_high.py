@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Update lifetime_high in ipo_master from actual daily price data (pq_daily).
+Update lifetime_high in ipo_master from actual daily price data.
 
 This script:
 1. Gets all IPO tickers and their IPO dates from ipo_master
-2. Queries pq_daily to find the actual maximum high since IPO date
-3. Updates ipo_master.lifetime_high with the correct value
+2. Queries pq_daily for regular session high
+3. Queries daily_prepost for pre-market and after-hours high
+4. Takes the maximum of all three for the true lifetime high
+5. Updates ipo_master.lifetime_high with the correct value
+
+IMPORTANT: Always use the RAW columns from daily_prepost (premarket_high_raw,
+afterhours_high_raw) - the adjusted columns (premarket_high, afterhours_high)
+have incorrect split adjustments that can be 1000x+ off.
 
 Usage:
     python update_lifetime_high.py --analyze      # Show discrepancies
@@ -31,7 +37,7 @@ def get_client():
 
 
 def analyze_single(ticker: str):
-    """Analyze lifetime_high for a single ticker."""
+    """Analyze lifetime_high for a single ticker including pre/post market."""
     client = get_client()
 
     print(f"\n{'=' * 60}")
@@ -50,72 +56,138 @@ def analyze_single(ticker: str):
         return
 
     row = result.result_rows[0]
-    print(f"IPO Date: {row[1]}")
+    ipo_date = row[1]
+    print(f"IPO Date: {ipo_date}")
     print(f"IPO Price: ${row[2]}")
     print(f"Current lifetime_high in DB: ${row[3]}")
 
-    # Calculate actual lifetime high from pq_daily
-    actual = client.query(f"""
+    # Get regular session high from pq_daily
+    regular = client.query(f"""
         SELECT
-            max(high) as actual_lifetime_high,
+            max(high) as max_high,
             argMax(trade_dt, high) as high_date,
             count() as trading_days
         FROM pq_daily
         WHERE symbol = '{ticker}'
-          AND trade_dt >= '{row[1]}'
+          AND trade_dt >= '{ipo_date}'
           AND high > 0
     """)
 
-    if actual.result_rows and actual.result_rows[0][0]:
-        actual_high = actual.result_rows[0][0]
-        high_date = actual.result_rows[0][1]
-        trading_days = actual.result_rows[0][2]
+    regular_high = regular.result_rows[0][0] if regular.result_rows and regular.result_rows[0][0] else 0
+    regular_date = regular.result_rows[0][1] if regular.result_rows else None
+    trading_days = regular.result_rows[0][2] if regular.result_rows else 0
 
-        print(f"\nActual lifetime high from pq_daily: ${actual_high:.2f} on {high_date}")
-        print(f"Trading days in database: {trading_days}")
+    print(f"\nRegular session high: ${regular_high:.2f}" + (f" on {regular_date}" if regular_date else ""))
+    print(f"Trading days in database: {trading_days}")
 
-        if abs(actual_high - row[3]) > 0.01:
-            print(f"\n⚠️  DISCREPANCY FOUND!")
-            print(f"   DB value: ${row[3]:.2f}")
-            print(f"   Actual:   ${actual_high:.2f}")
-            print(f"   Difference: ${actual_high - row[3]:.2f}")
-        else:
-            print(f"\n✓ Lifetime high is correct")
+    # Get pre-market high from daily_prepost (use RAW columns - adjusted columns are broken)
+    premarket = client.query(f"""
+        SELECT
+            max(premarket_high_raw) as max_high,
+            argMax(trade_dt, premarket_high_raw) as high_date
+        FROM daily_prepost
+        WHERE symbol = '{ticker}'
+          AND trade_dt >= '{ipo_date}'
+          AND premarket_high_raw > 0
+    """)
+
+    premarket_high = premarket.result_rows[0][0] if premarket.result_rows and premarket.result_rows[0][0] else 0
+    premarket_date = premarket.result_rows[0][1] if premarket.result_rows else None
+
+    print(f"Pre-market high: ${premarket_high:.2f}" + (f" on {premarket_date}" if premarket_date and premarket_high > 0 else ""))
+
+    # Get after-hours high from daily_prepost (use RAW columns)
+    afterhours = client.query(f"""
+        SELECT
+            max(afterhours_high_raw) as max_high,
+            argMax(trade_dt, afterhours_high_raw) as high_date
+        FROM daily_prepost
+        WHERE symbol = '{ticker}'
+          AND trade_dt >= '{ipo_date}'
+          AND afterhours_high_raw > 0
+    """)
+
+    afterhours_high = afterhours.result_rows[0][0] if afterhours.result_rows and afterhours.result_rows[0][0] else 0
+    afterhours_date = afterhours.result_rows[0][1] if afterhours.result_rows else None
+
+    print(f"After-hours high: ${afterhours_high:.2f}" + (f" on {afterhours_date}" if afterhours_date and afterhours_high > 0 else ""))
+
+    # Calculate true lifetime high (max of all three)
+    all_highs = [
+        (regular_high, regular_date, "Regular"),
+        (premarket_high, premarket_date, "Pre-market"),
+        (afterhours_high, afterhours_date, "After-hours")
+    ]
+    actual_high, actual_date, session = max(all_highs, key=lambda x: x[0] or 0)
+
+    print(f"\n>>> TRUE LIFETIME HIGH: ${actual_high:.2f} ({session}" + (f" on {actual_date})" if actual_date else ")"))
+
+    if abs(actual_high - row[3]) > 0.01:
+        print(f"\n[!] DISCREPANCY FOUND!")
+        print(f"   DB value: ${row[3]:.2f}")
+        print(f"   Actual:   ${actual_high:.2f}")
+        print(f"   Difference: ${actual_high - row[3]:.2f}")
     else:
-        print(f"\nNo daily price data found for {ticker}")
+        print(f"\n[OK] Lifetime high is correct")
 
 
 def analyze():
-    """Analyze all IPOs for lifetime_high discrepancies."""
+    """Analyze all IPOs for lifetime_high discrepancies including pre/post market."""
     client = get_client()
 
     print("\n" + "=" * 60)
-    print("LIFETIME HIGH DISCREPANCY ANALYSIS")
+    print("LIFETIME HIGH DISCREPANCY ANALYSIS (incl. pre/post market)")
     print("=" * 60)
 
-    # Find IPOs where lifetime_high doesn't match max(high) from pq_daily
-    result = client.query("""
+    # Find IPOs where lifetime_high doesn't match max across all sessions
+    # Combine regular, pre-market, and after-hours highs
+    # Filter out obviously bad data (prices over $100,000 are likely errors)
+    MAX_SANE_PRICE = 100000.0
+
+    result = client.query(f"""
         SELECT
             i.polygon_ticker,
             i.ipo_date,
             i.ipo_price,
             i.lifetime_high as db_lifetime_high,
-            p.actual_high,
-            p.high_date,
-            p.actual_high - i.lifetime_high as diff
+            greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) as actual_high,
+            greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high as diff
         FROM ipo_master i
-        JOIN (
+        LEFT JOIN (
             SELECT
                 symbol,
-                max(high) as actual_high,
-                argMax(trade_dt, high) as high_date
+                max(high) as regular_high
             FROM pq_daily
-            WHERE high > 0
+            WHERE high > 0 AND high < {MAX_SANE_PRICE}
             GROUP BY symbol
         ) p ON i.polygon_ticker = p.symbol
+        LEFT JOIN (
+            SELECT
+                symbol,
+                max(premarket_high_raw) as pm_high,
+                max(afterhours_high_raw) as ah_high
+            FROM daily_prepost
+            GROUP BY symbol
+        ) pp ON i.polygon_ticker = pp.symbol
         WHERE i.ipo_date != toDate('1970-01-01')
-          AND abs(p.actual_high - i.lifetime_high) > 0.05
-        ORDER BY abs(p.actual_high - i.lifetime_high) DESC
+          AND abs(greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high) > 0.05
+        ORDER BY abs(greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high) DESC
         LIMIT 100
     """)
 
@@ -124,27 +196,33 @@ def analyze():
     print("-" * 60)
 
     for row in result.result_rows[:30]:
-        ticker, ipo_date, ipo_price, db_val, actual, high_date, diff = row
+        ticker, ipo_date, ipo_price, db_val, actual, diff = row
         print(f"{ticker:<12} {str(ipo_date):<12} ${db_val:>8.2f} ${actual:>8.2f} ${diff:>+8.2f}")
 
     if len(result.result_rows) > 30:
         print(f"... and {len(result.result_rows) - 30} more")
 
     # Summary stats
-    summary = client.query("""
+    summary = client.query(f"""
         SELECT
             count() as total_ipos,
             countIf(i.lifetime_high = 0) as zero_lifetime_high,
-            countIf(abs(p.actual_high - i.lifetime_high) > 0.05) as mismatched
+            countIf(abs(greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high) > 0.05) as mismatched
         FROM ipo_master i
         LEFT JOIN (
-            SELECT
-                symbol,
-                max(high) as actual_high
-            FROM pq_daily
-            WHERE high > 0
-            GROUP BY symbol
+            SELECT symbol, max(high) as regular_high
+            FROM pq_daily WHERE high > 0 AND high < {MAX_SANE_PRICE} GROUP BY symbol
         ) p ON i.polygon_ticker = p.symbol
+        LEFT JOIN (
+            SELECT symbol,
+                max(premarket_high_raw) as pm_high,
+                max(afterhours_high_raw) as ah_high
+            FROM daily_prepost GROUP BY symbol
+        ) pp ON i.polygon_ticker = pp.symbol
         WHERE i.ipo_date != toDate('1970-01-01')
     """)
 
@@ -158,34 +236,55 @@ def analyze():
 
 
 def execute(limit=None, dry_run=False):
-    """Update lifetime_high for all IPOs from pq_daily data."""
+    """Update lifetime_high for all IPOs including pre/post market highs."""
     client = get_client()
 
     print("\n" + "=" * 60)
-    print("UPDATING LIFETIME HIGH" + (" (DRY RUN)" if dry_run else ""))
+    print("UPDATING LIFETIME HIGH (incl. pre/post market)" + (" (DRY RUN)" if dry_run else ""))
     print("=" * 60)
 
     limit_clause = f"LIMIT {limit}" if limit else ""
 
-    # Get IPOs that need updating (where actual differs from stored)
+    # Filter out obviously bad data (prices over $100,000 are likely errors)
+    MAX_SANE_PRICE = 100000.0
+
+    # Get IPOs that need updating - max across regular, premarket, afterhours
     query = f"""
         SELECT
             i.polygon_ticker,
             i.lifetime_high as current_val,
-            p.actual_high,
-            p.actual_high - i.lifetime_high as diff
+            greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) as actual_high,
+            greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high as diff
         FROM ipo_master i
-        JOIN (
-            SELECT
-                symbol,
-                max(high) as actual_high
-            FROM pq_daily
-            WHERE high > 0
-            GROUP BY symbol
+        LEFT JOIN (
+            SELECT symbol, max(high) as regular_high
+            FROM pq_daily WHERE high > 0 AND high < {MAX_SANE_PRICE} GROUP BY symbol
         ) p ON i.polygon_ticker = p.symbol
+        LEFT JOIN (
+            SELECT symbol,
+                max(premarket_high_raw) as pm_high,
+                max(afterhours_high_raw) as ah_high
+            FROM daily_prepost GROUP BY symbol
+        ) pp ON i.polygon_ticker = pp.symbol
         WHERE i.ipo_date != toDate('1970-01-01')
-          AND (i.lifetime_high = 0 OR abs(p.actual_high - i.lifetime_high) > 0.01)
-        ORDER BY abs(p.actual_high - i.lifetime_high) DESC
+          AND (i.lifetime_high = 0 OR abs(greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high) > 0.01)
+        ORDER BY abs(greatest(
+                coalesce(p.regular_high, 0),
+                if(coalesce(pp.pm_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.pm_high, 0), 0),
+                if(coalesce(pp.ah_high, 0) < {MAX_SANE_PRICE}, coalesce(pp.ah_high, 0), 0)
+            ) - i.lifetime_high) DESC
         {limit_clause}
     """
 
@@ -233,21 +332,34 @@ def execute(limit=None, dry_run=False):
 
 
 def update_single(ticker: str):
-    """Update lifetime_high for a single ticker."""
+    """Update lifetime_high for a single ticker including pre/post market."""
     client = get_client()
 
-    # Get actual lifetime high
+    # Get max across regular, premarket, afterhours sessions
     result = client.query(f"""
-        SELECT max(high) as actual_high
-        FROM pq_daily
-        WHERE symbol = '{ticker}'
-          AND high > 0
+        SELECT
+            greatest(
+                coalesce(p.regular_high, 0),
+                coalesce(pp.premarket_high, 0),
+                coalesce(pp.afterhours_high, 0)
+            ) as actual_high
+        FROM (SELECT 1) dummy
+        LEFT JOIN (
+            SELECT max(high) as regular_high
+            FROM pq_daily WHERE symbol = '{ticker}' AND high > 0
+        ) p ON 1=1
+        LEFT JOIN (
+            SELECT
+                max(premarket_high_raw) as premarket_high,
+                max(afterhours_high_raw) as afterhours_high
+            FROM daily_prepost WHERE symbol = '{ticker}' AND (premarket_high_raw > 0 OR afterhours_high_raw > 0)
+        ) pp ON 1=1
     """)
 
     if result.result_rows and result.result_rows[0][0]:
         actual_high = result.result_rows[0][0]
 
-        print(f"Updating {ticker} lifetime_high to ${actual_high:.2f}")
+        print(f"Updating {ticker} lifetime_high to ${actual_high:.2f} (incl. pre/post market)")
 
         client.command(f"""
             ALTER TABLE ipo_master UPDATE

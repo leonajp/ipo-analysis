@@ -19,7 +19,7 @@ Usage:
 """
 
 # VERSION - Update when making changes to verify user has latest code
-DASHBOARD_VERSION = "2.3.0-operations"
+DASHBOARD_VERSION = "2.4.0-adj-prices"
 
 import streamlit as st
 import pandas as pd
@@ -1125,7 +1125,20 @@ def underwriter_opportunities_page():
         return
 
     # Clean up columns
-    df_analysis['ipo_price'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
+    df_analysis['ipo_price_original'] = pd.to_numeric(df_analysis.get('IPO Sh Px', df_analysis.get('ipo_price', 0)), errors='coerce')
+
+    # Get split factor for adjusting IPO price (default to 1 if not available)
+    df_analysis['split_factor'] = pd.to_numeric(df_analysis.get('split_factor', 1), errors='coerce').fillna(1)
+    # Replace 0 with 1 to avoid division issues
+    df_analysis.loc[df_analysis['split_factor'] == 0, 'split_factor'] = 1
+
+    # Calculate adjusted IPO price (original price * split factor)
+    # This brings IPO price to current share terms for accurate return calculations
+    df_analysis['ipo_price_adj'] = df_analysis['ipo_price_original'] * df_analysis['split_factor']
+
+    # Use adjusted IPO price for all calculations going forward
+    df_analysis['ipo_price'] = df_analysis['ipo_price_adj']
+
     # Get current price - try last_price_adj first (ClickHouse), then last_px_adj, then current_price
     df_analysis['current_price'] = pd.to_numeric(
         df_analysis.get('last_price_adj', df_analysis.get('last_px_adj', df_analysis.get('current_price', 0))),
@@ -1165,6 +1178,29 @@ def underwriter_opportunities_page():
     if ticker_col not in df_analysis.columns:
         df_analysis['ticker_clean'] = df_analysis['Ticker'].astype(str).str.replace(' US Equity', '').str.strip() if 'Ticker' in df_analysis.columns else 'N/A'
         ticker_col = 'ticker_clean'
+
+    # ========================================================================
+    # TICKER FILTER (at top)
+    # ========================================================================
+    st.subheader("🔍 Search")
+
+    # Get list of all tickers for the filter
+    all_tickers = sorted(df_analysis[ticker_col].dropna().unique().tolist())
+
+    # Ticker search/filter
+    ticker_filter = st.multiselect(
+        "Filter by Ticker(s)",
+        options=all_tickers,
+        default=[],
+        placeholder="Type to search tickers...",
+        help="Select one or more tickers to filter. Leave empty to show all.",
+        key="opp_ticker_filter"
+    )
+
+    # Apply ticker filter early if specified
+    if ticker_filter:
+        df_analysis = df_analysis[df_analysis[ticker_col].isin(ticker_filter)]
+        st.info(f"Showing {len(df_analysis)} IPOs matching selected ticker(s)")
 
     # ========================================================================
     # FILTERS (with saved defaults)
@@ -1465,7 +1501,9 @@ def underwriter_opportunities_page():
 
         # Format columns for display
         display_opps['IPO Date'] = display_opps['ipo_date_parsed'].dt.strftime('%Y-%m-%d')
-        display_opps['IPO Px'] = display_opps['ipo_price'].apply(lambda x: f"${x:.2f}")
+        # Show both original and adjusted IPO prices
+        display_opps['IPO Px (Orig)'] = display_opps['ipo_price_original'].apply(lambda x: f"${x:.2f}" if pd.notna(x) and x > 0 else "N/A")
+        display_opps['IPO Px (Adj)'] = display_opps['ipo_price_adj'].apply(lambda x: f"${x:.2f}" if pd.notna(x) and x > 0 else "N/A")
         display_opps['Life Hi'] = display_opps['lifetime_high'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
         display_opps['Current'] = display_opps['current_price'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
         display_opps['Return'] = display_opps['current_return_pct'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
@@ -1543,7 +1581,8 @@ def underwriter_opportunities_page():
             display_opps['Company'] = ''
 
         # Build column list - use Ops_tooltip instead of Ops for hover details
-        display_cols = [ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'Ops_tooltip', 'UW Rate']
+        # Include both Original and Adjusted IPO prices
+        display_cols = [ticker_col, 'Company', 'underwriter_clean', 'IPO Date', 'IPO Px (Orig)', 'IPO Px (Adj)', 'Life Hi', 'Current', 'Return', 'Close to 2x', 'Upside', 'Ops_tooltip', 'UW Rate']
 
         st.dataframe(
             display_opps[display_cols].rename(columns={
@@ -1565,9 +1604,13 @@ def underwriter_opportunities_page():
         # Legend
         st.markdown("""
         **Legend:**
-        - **Life Hi**: Lifetime high price (adjusted for splits, capped at 50x IPO)
-        - **Close to 2x**: How close lifetime high got to 2x IPO price (100% = hit double)
-        - **Upside**: Potential gain if stock reaches 2x IPO price from current price
+        - **IPO Px (Orig)**: Original IPO price at the time of offering
+        - **IPO Px (Adj)**: Split-adjusted IPO price (for accurate return calculations vs current price)
+        - **Life Hi**: Lifetime high price (already split-adjusted)
+        - **Current**: Current stock price (split-adjusted)
+        - **Return**: Current return vs adjusted IPO price
+        - **Close to 2x**: How close lifetime high got to 2x adjusted IPO price (100% = hit double)
+        - **Upside**: Potential gain if stock reaches 2x adjusted IPO price from current price
         - **Ops**: Operations detected (format: `count | date: $price +gain%`). Operation = volume spike (>5x median) + price >50% above IPO
         - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
         """)
