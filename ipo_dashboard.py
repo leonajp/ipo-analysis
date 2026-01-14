@@ -19,7 +19,7 @@ Usage:
 """
 
 # VERSION - Update when making changes to verify user has latest code
-DASHBOARD_VERSION = "2.4.0-adj-prices"
+DASHBOARD_VERSION = "2.5.0-clickhouse-only"
 
 import streamlit as st
 import pandas as pd
@@ -387,14 +387,15 @@ def load_from_clickhouse(password: str = None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner="Loading IPO data...")
-def load_ipo_data(use_clickhouse: bool = True, ch_password: str = None, _cache_key: str = None):
-    """Load the IPO analysis data (from ClickHouse or CSV fallback).
-    
+def load_ipo_data(ch_password: str = None, _cache_key: str = None, use_clickhouse: bool = True):
+    """Load the IPO analysis data from ClickHouse.
+
     Note: _cache_key is used to force cache refresh when data source changes.
+    Note: use_clickhouse kept for backward compatibility but always True.
     """
-    
-    # Try ClickHouse first if enabled
-    if use_clickhouse and HAS_CLICKHOUSE:
+
+    # Load from ClickHouse
+    if HAS_CLICKHOUSE:
         df = load_from_clickhouse(ch_password)
         if df is not None and len(df) > 0:
             # Map ClickHouse columns to expected dashboard columns
@@ -545,179 +546,15 @@ def load_ipo_data(use_clickhouse: bool = True, ch_password: str = None, _cache_k
             st.sidebar.caption(f"📊 Underwriters: {uw_count:,} ({uw_pct:.0f}%)")
             st.sidebar.caption(f"📈 Bounce source: {bounce_source}")
             return df
-    
-    # Fallback to CSV files
-    possible_paths = [
-        # Priority 1: eqsipo files (most complete with WTF etc.)
-        r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\eqsipo_final.csv',
-        r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\eqsipo_complete.csv',
-        'eqsipo_final.csv',
-        'eqsipo_complete.csv',
-        # Priority 2: adjusted files
-        'small_ipo_fully_adjusted.csv',
-        'data/small_ipo_fully_adjusted.csv',
-        r'C:\Users\msui\Documents\Coding Projects\IPO Analysis\small_ipo_fully_adjusted.csv',
-        r'P:\Hamren\Other\small_ipo_fully_adjusted.csv',
-        # Priority 3: unadjusted
-        'eqsipo_unadj.csv',
-    ]
-    
-    for path in possible_paths:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            
-            # Handle different date column names
-            if 'date' not in df.columns and 'IPO Dt' in df.columns:
-                df['date'] = pd.to_datetime(df['IPO Dt'], errors='coerce')
-            elif 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            
-            # Clean ticker - handle both "WTF US Equity" and "WTF" formats
-            if 'ticker_clean' not in df.columns:
-                if 'Ticker' in df.columns:
-                    df['ticker_clean'] = df['Ticker'].astype(str).str.replace(' US Equity', '', regex=False).str.strip()
-                elif 'ticker' in df.columns:
-                    df['ticker_clean'] = df['ticker'].astype(str).str.replace(' US Equity', '', regex=False).str.strip()
-                else:
-                    df['ticker_clean'] = ''
-            
-            # Ensure underwriter column exists
-            if 'underwriter' not in df.columns:
-                if 'IPO Lead' in df.columns:
-                    df['underwriter'] = df['IPO Lead'].fillna('')
-                else:
-                    df['underwriter'] = ''
-            
-            # Patch known missing underwriter data
-            KNOWN_UNDERWRITERS = {
-                'WTF': 'CATHAY SECURITIES,DOMINARI',
-                'WATO': 'CATHAY SECURITIES',
-            }
-            for ticker, uw in KNOWN_UNDERWRITERS.items():
-                mask = df['ticker_clean'] == ticker
-                if mask.any():
-                    # Only patch if underwriter is empty/NaN
-                    empty_mask = mask & (df['underwriter'].isna() | (df['underwriter'] == ''))
-                    df.loc[empty_mask, 'underwriter'] = uw
-            
-            # Add risk score if missing
-            if 'operation_risk_score' not in df.columns:
-                df['operation_risk_score'] = 0
-                if 'IPO Sh Px' in df.columns:
-                    df.loc[df['IPO Sh Px'] <= 5, 'operation_risk_score'] += 15
-                if 'IPO Sh Offered' in df.columns:
-                    df.loc[df['IPO Sh Offered'] <= 1_500_000, 'operation_risk_score'] += 15
-                
-                # Add operation underwriter risk
-                if 'underwriter' in df.columns:
-                    for op_uw in OPERATION_UNDERWRITERS:
-                        mask = df['underwriter'].str.contains(op_uw, case=False, na=False)
-                        df.loc[mask, 'operation_risk_score'] += 10
-            
-            # Always recalculate/validate lifetime_hi_vs_ipo with improved split adjustment
-            if 'Lifetime High' in df.columns and 'IPO Sh Px' in df.columns:
-                # Convert to numeric
-                df['IPO Sh Px'] = pd.to_numeric(df['IPO Sh Px'], errors='coerce').fillna(0)
-                df['Lifetime High'] = pd.to_numeric(df['Lifetime High'], errors='coerce').fillna(0)
-                
-                # Check for d1_open and d1_close columns
-                d1_open_col = None
-                d1_close_col = None
-                for col in ['d1_open', 'D1 Open', 'open_px', 'Open']:
-                    if col in df.columns:
-                        d1_open_col = col
-                        break
-                for col in ['d1_close', 'D1 Close', 'close_px', 'Close']:
-                    if col in df.columns:
-                        d1_close_col = col
-                        break
-                
-                if d1_open_col:
-                    df['d1_open_price'] = pd.to_numeric(df[d1_open_col], errors='coerce').fillna(0)
-                else:
-                    df['d1_open_price'] = 0
-                    
-                if d1_close_col:
-                    df['d1_close_price'] = pd.to_numeric(df[d1_close_col], errors='coerce').fillna(0)
-                else:
-                    df['d1_close_price'] = 0
-                
-                # Calculate ratios
-                df['d1_to_ipo_ratio'] = np.where(
-                    (df['IPO Sh Px'] > 0) & (df['d1_open_price'] > 0),
-                    df['d1_open_price'] / df['IPO Sh Px'],
-                    1.0
-                )
-                df['lt_to_ipo_ratio'] = np.where(
-                    df['IPO Sh Px'] > 0,
-                    df['Lifetime High'] / df['IPO Sh Px'],
-                    0
-                )
-                
-                # Determine reference price based on scenario
-                df['reference_price'] = np.where(
-                    # Scenario 1: D1 open differs > 2x from IPO price
-                    (df['d1_open_price'] > 0.10) & ((df['d1_to_ipo_ratio'] > 2.0) | (df['d1_to_ipo_ratio'] < 0.5)),
-                    df['d1_open_price'],
-                    np.where(
-                        # Scenario 2: Both prices similar but lifetime_high >> both (50x+)
-                        (df['d1_to_ipo_ratio'] >= 0.5) & (df['d1_to_ipo_ratio'] <= 2.0) & (df['lt_to_ipo_ratio'] > 50),
-                        np.where(df['d1_close_price'] > 0.10, df['d1_close_price'], df['d1_open_price']),
-                        # Scenario 3: Normal - use IPO price or D1 open
-                        np.where(df['IPO Sh Px'] >= 0.50, df['IPO Sh Px'], df['d1_open_price'])
-                    )
-                )
-                
-                # Calculate bounce using reference price
-                df['lifetime_hi_vs_ipo'] = np.where(
-                    (df['reference_price'] >= 0.10) & (df['Lifetime High'] > 0),
-                    ((df['Lifetime High'] / df['reference_price']) - 1) * 100,
-                    0
-                )
-                
-                # Cap based on scenario - aggressive cap for suspected unadjusted data
-                df['lifetime_hi_vs_ipo'] = np.where(
-                    (df['d1_to_ipo_ratio'] >= 0.5) & (df['d1_to_ipo_ratio'] <= 2.0) & (df['lt_to_ipo_ratio'] > 50),
-                    np.clip(df['lifetime_hi_vs_ipo'].values, -100, 1000),  # Aggressive cap
-                    np.clip(df['lifetime_hi_vs_ipo'].values, -100, 5000)   # Normal cap
-                )
-                
-                # ============================================================
-                # FINAL UNCONDITIONAL CAP - catches ANY edge cases
-                # ============================================================
-                df['lifetime_hi_vs_ipo'] = np.clip(df['lifetime_hi_vs_ipo'].values, -100, 10000)
-                
-                # Filter out bad data: IPO price < $0.50 AND bounce > 1000%
-                bad_data_mask = (df['IPO Sh Px'] < 0.50) & (df['lifetime_hi_vs_ipo'] > 1000)
-                df.loc[bad_data_mask, 'lifetime_hi_vs_ipo'] = 0
-                
-            elif 'lifetime_hi_vs_ipo' in df.columns:
-                # If column exists but source columns don't, just cap existing values
-                df['lifetime_hi_vs_ipo'] = pd.to_numeric(df['lifetime_hi_vs_ipo'], errors='coerce').fillna(0)
-                df['lifetime_hi_vs_ipo'] = np.clip(df['lifetime_hi_vs_ipo'].values, -100, 10000)
-            else:
-                df['lifetime_hi_vs_ipo'] = 0
-            
-            # Count underwriter coverage
-            uw_col = 'underwriter' if 'underwriter' in df.columns else 'IPO Lead' if 'IPO Lead' in df.columns else None
-            if uw_col:
-                has_uw = df[uw_col].notna() & (df[uw_col] != '') & (df[uw_col] != 'Unknown')
-                uw_count = has_uw.sum()
-                uw_pct = uw_count / len(df) * 100 if len(df) > 0 else 0
-                st.sidebar.success(f"✅ CSV: {len(df):,} IPOs")
-                st.sidebar.caption(f"📊 Underwriters: {uw_count:,} ({uw_pct:.0f}%)")
-            else:
-                st.sidebar.success(f"✅ CSV: {len(df):,} IPOs")
-            
-            return df
-    
+
+    # ClickHouse connection failed
     st.error("""
-    Could not find IPO data file.
-    
-    Please place one of these files in the same folder as this dashboard:
-    - small_ipo_fully_adjusted.csv
-    - eqsipo_complete.csv
-    - eqsipo_final.csv
+    ❌ Could not connect to ClickHouse.
+
+    Please check:
+    1. ClickHouse password is correct
+    2. Network connection is available
+    3. clickhouse-connect is installed: `pip install clickhouse-connect`
     """)
     return pd.DataFrame()
 
@@ -2391,80 +2228,69 @@ def analysis_page():
     st.sidebar.caption(f"v{DASHBOARD_VERSION}")
     
     # ========================================================================
-    # DATA SOURCE - ClickHouse or CSV fallback
+    # DATA SOURCE - ClickHouse Only
     # ========================================================================
     st.sidebar.subheader("🗄️ Data Source")
 
-    use_clickhouse = False
+    use_clickhouse = True
     ch_password = None
 
     if not HAS_CLICKHOUSE:
-        st.sidebar.warning("Install: `pip install clickhouse-connect`")
-        st.sidebar.caption("📁 Using CSV fallback")
-    else:
-        # Get saved password using helper function
-        saved_ch_password = get_clickhouse_password()
+        st.sidebar.error("❌ Install: `pip install clickhouse-connect`")
+        st.stop()
 
-        if saved_ch_password:
-            # Password exists - default to ClickHouse
-            use_clickhouse = st.sidebar.checkbox(
-                "Use ClickHouse",
-                value=True,
-                help="Load IPO data from ClickHouse Cloud (recommended for latest data)"
-            )
+    # Get saved password using helper function
+    saved_ch_password = get_clickhouse_password()
 
-            if use_clickhouse:
-                ch_password = saved_ch_password
-                st.sidebar.success("✅ Using ClickHouse")
+    if saved_ch_password:
+        # Password exists - use ClickHouse
+        ch_password = saved_ch_password
+        st.sidebar.success("✅ Connected to ClickHouse")
 
-                # Password management in expander
-                with st.sidebar.expander("⚙️ ClickHouse Settings"):
-                    st.caption(f"Host: {CLICKHOUSE_CONFIG['host'][:30]}...")
+        # Password management in expander
+        with st.sidebar.expander("⚙️ ClickHouse Settings"):
+            st.caption(f"Host: {CLICKHOUSE_CONFIG['host'][:30]}...")
 
-                    new_password = st.text_input(
-                        "Password",
-                        value=saved_ch_password,
-                        type="password",
-                        key="ch_password_input"
-                    )
-                    if new_password != saved_ch_password:
-                        save_clickhouse_password(new_password)
-                        st.success("✅ Password updated!")
-                        st.rerun()
-
-                    if st.button("🗑️ Clear Password", key="clear_ch_btn"):
-                        clear_clickhouse_password()
-                        st.rerun()
-
-                # Reload button
-                if st.sidebar.button("🔄 Reload Data", key="reload_ch_btn"):
-                    st.cache_data.clear()
-                    st.rerun()
-            else:
-                st.sidebar.caption("📁 Using CSV file")
-        else:
-            # No password - show input form
-            st.sidebar.info("💡 Enter ClickHouse password for latest data")
-
-            ch_password_input = st.sidebar.text_input(
-                "ClickHouse Password",
-                value='',
+            new_password = st.text_input(
+                "Password",
+                value=saved_ch_password,
                 type="password",
-                key="ch_password_new",
-                help="Enter password to connect to ClickHouse Cloud"
+                key="ch_password_input"
             )
+            if new_password != saved_ch_password:
+                save_clickhouse_password(new_password)
+                st.success("✅ Password updated!")
+                st.rerun()
 
-            col1, col2 = st.sidebar.columns(2)
-            with col1:
-                if st.button("💾 Save", key="save_ch_btn"):
-                    if ch_password_input:
-                        save_clickhouse_password(ch_password_input)
-                        st.sidebar.success("✅ Password saved!")
-                        st.rerun()
-                    else:
-                        st.sidebar.error("Please enter a password")
+            if st.button("🗑️ Clear Password", key="clear_ch_btn"):
+                clear_clickhouse_password()
+                st.rerun()
 
-            st.sidebar.caption("📁 Currently using CSV fallback")
+        # Reload button
+        if st.sidebar.button("🔄 Reload Data", key="reload_ch_btn"):
+            st.cache_data.clear()
+            st.rerun()
+    else:
+        # No password - show input form
+        st.sidebar.warning("🔐 Enter ClickHouse password to continue")
+
+        ch_password_input = st.sidebar.text_input(
+            "ClickHouse Password",
+            value='',
+            type="password",
+            key="ch_password_new",
+            help="Enter password to connect to ClickHouse Cloud"
+        )
+
+        if st.sidebar.button("💾 Connect", key="save_ch_btn"):
+            if ch_password_input:
+                save_clickhouse_password(ch_password_input)
+                st.sidebar.success("✅ Connected!")
+                st.rerun()
+            else:
+                st.sidebar.error("Please enter a password")
+
+        st.stop()  # Don't proceed without ClickHouse connection
     
     # Polygon API key section
     st.sidebar.markdown("---")
