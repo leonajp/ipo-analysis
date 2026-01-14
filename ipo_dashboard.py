@@ -1309,7 +1309,7 @@ def underwriter_opportunities_page():
             (low_dollar['underwriter_clean'].isin(high_success_uw)) |
             (low_dollar['underwriter_clean'].isna()) |
             (low_dollar['underwriter_clean'] == '') |
-            (low_dollar['underwriter_clean'] == 'Unknown') |
+            (low_dollar['underwriter_clean'] == 'UNKNOWN') |
             (~low_dollar['underwriter_clean'].isin(underwriters_with_history) &
              low_dollar['underwriter_clean'].notna() &
              (low_dollar['underwriter_clean'] != ''))
