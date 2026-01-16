@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v7"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v8"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -1061,16 +1061,18 @@ def underwriter_opportunities_page():
     saved_filters = config.get('opportunity_filters', {})
 
     # Default values (used if no saved config)
+    # max_lifetime_options = ["Below IPO price", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%", "150%", "200%", "Any"]
+    #                         0                  1      2      3      4      5      6      7      8      9      10      11      12      13
     default_filters = {
         'low_dollar_min': 1.0,
         'low_dollar_max': 10.0,
         'lookback_months': 24,
         'min_uw_ipos': 2,
         'min_double_rate': 30,
-        'min_close_to_target': 50,  # Lowered from 80 to be more inclusive
-        'max_lifetime_gain_idx': 0,  # Index for "Below IPO price" - hasn't pumped at all
+        'min_close_to_target': 10,  # Lowered to be more inclusive
+        'max_lifetime_gain_idx': 13,  # Index for "Any" - no lifetime gain restriction
         'min_uw_rate_idx': 0,  # Index for "Any" - don't require high success underwriter
-        'operation_filter_idx': 0,  # Index for "No operations" - hasn't been operated
+        'operation_filter_idx': 1,  # Index for "Any" - no operation filter (0="No operations", 1="Any")
         'include_no_uw': True,  # Include IPOs without underwriter data
         'volume_filter_day': 'D1',  # Which day's volume to filter (D1, D5, D10, D20)
         'min_volume': 0,  # Minimum volume for the selected day (0 = no filter)
