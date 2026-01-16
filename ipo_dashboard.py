@@ -19,7 +19,9 @@ Usage:
 """
 
 # VERSION - Update when making changes to verify user has latest code
-DASHBOARD_VERSION = "2.5.0-clickhouse-only"
+# Also used as cache key to bust Streamlit Cloud cache when data schema changes
+DASHBOARD_VERSION = "2.6.0"
+DATA_VERSION = "2026-01-16"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -946,7 +948,7 @@ def underwriter_opportunities_page():
     # Load data
     use_ch = st.session_state.get('use_clickhouse', False)
     ch_pw = st.session_state.get('ch_password', None)
-    cache_key = f"ch_{use_ch}_{bool(ch_pw)}"
+    cache_key = f"ch_{use_ch}_{bool(ch_pw)}_{DATA_VERSION}"
     df = load_ipo_data(use_clickhouse=use_ch, ch_password=ch_pw, _cache_key=cache_key)
 
     if df.empty:
@@ -1614,7 +1616,7 @@ def statistics_page():
     # Load data (use session state for ClickHouse settings if available)
     use_ch = st.session_state.get('use_clickhouse', False)
     ch_pw = st.session_state.get('ch_password', None)
-    cache_key = f"ch_{use_ch}_{bool(ch_pw)}"
+    cache_key = f"ch_{use_ch}_{bool(ch_pw)}_{DATA_VERSION}"
     df = load_ipo_data(use_clickhouse=use_ch, ch_password=ch_pw, _cache_key=cache_key)
     if df.empty:
         st.warning("No data loaded")
@@ -2424,7 +2426,7 @@ def analysis_page():
     st.session_state['ch_password'] = ch_password
     
     # Create cache key based on data source settings
-    cache_key = f"ch_{use_clickhouse}_{bool(ch_password)}"
+    cache_key = f"ch_{use_clickhouse}_{bool(ch_password)}_{DATA_VERSION}"
     df = load_ipo_data(use_clickhouse=use_clickhouse, ch_password=ch_password, _cache_key=cache_key)
     
     if df.empty:
