@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v5"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v6"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -1421,15 +1421,57 @@ def underwriter_opportunities_page():
     else:
         volume_filter = True
 
+    # Build individual filter conditions for debugging
+    close_to_target_filter = low_dollar['close_to_target_pct'] >= min_close_to_target
+    date_filter = low_dollar['ipo_date_parsed'] >= cutoff_date
+    current_price_filter = (low_dollar['current_price'].notna()) & (low_dollar['current_price'] > 0)
+
+    # DEBUG: Show filter status for each ticker in the debug expander
+    with st.expander("🔍 Debug: Filter Status for Each Ticker", expanded=False):
+        st.write(f"**Filter Settings:** min_close_to_target={min_close_to_target}%, cutoff_date={cutoff_date.strftime('%Y-%m-%d')}")
+        st.write(f"**include_no_uw:** {include_no_uw}")
+        st.write(f"**Underwriters with history:** {len(underwriters_with_history)} underwriters")
+
+        for ticker in debug_tickers:
+            ticker_mask = low_dollar[ticker_col] == ticker
+            if ticker_mask.sum() == 0:
+                continue
+            idx = ticker_mask.idxmax()
+            row = low_dollar.loc[idx]
+
+            st.write(f"**{ticker}:**")
+            filters = {
+                'uw_filter': uw_filter.loc[idx] if hasattr(uw_filter, 'loc') else uw_filter,
+                'lifetime_filter': lifetime_filter.loc[idx] if hasattr(lifetime_filter, 'loc') else lifetime_filter,
+                'operation_filter': operation_status_filter.loc[idx] if hasattr(operation_status_filter, 'loc') else operation_status_filter,
+                'volume_filter': volume_filter.loc[idx] if hasattr(volume_filter, 'loc') else volume_filter,
+                'close_to_target': close_to_target_filter.loc[idx],
+                'date_filter': date_filter.loc[idx],
+                'current_price': current_price_filter.loc[idx],
+            }
+
+            failed = [k for k, v in filters.items() if not v]
+            if failed:
+                st.error(f"  ❌ FAILED: {', '.join(failed)}")
+                # Show details for failed filters
+                if 'close_to_target' in failed:
+                    st.write(f"    - close_to_target_pct: {row.get('close_to_target_pct', 'N/A')}% (need >= {min_close_to_target}%)")
+                if 'uw_filter' in failed:
+                    uw = row.get('underwriter_clean', '')
+                    st.write(f"    - underwriter: {uw}")
+                    st.write(f"    - in high_success_uw: {uw in high_success_uw}")
+                    st.write(f"    - in underwriters_with_history: {uw in underwriters_with_history}")
+            else:
+                st.success(f"  ✅ All filters pass")
+
     opportunities = low_dollar[
         uw_filter &
         lifetime_filter &  # Hasn't exceeded max lifetime gain
         operation_status_filter &  # Operation status filter
         volume_filter &  # Minimum D1 volume
-        (low_dollar['close_to_target_pct'] >= min_close_to_target) &  # Got close enough to target
-        (low_dollar['ipo_date_parsed'] >= cutoff_date) &
-        (low_dollar['current_price'].notna()) &
-        (low_dollar['current_price'] > 0)
+        close_to_target_filter &  # Got close enough to target
+        date_filter &
+        current_price_filter
     ].copy()
 
     # Merge with underwriter stats
