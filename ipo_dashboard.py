@@ -1063,6 +1063,7 @@ def underwriter_opportunities_page():
         'min_uw_rate_idx': 0,  # Index for "Any" - don't require high success underwriter
         'operation_filter_idx': 0,  # Index for "No operations" - hasn't been operated
         'include_no_uw': True,  # Include IPOs without underwriter data
+        'min_d1_volume': 0,  # Minimum Day 1 volume (0 = no filter)
     }
 
     # Merge saved with defaults
@@ -1167,6 +1168,19 @@ def underwriter_opportunities_page():
             help="Include recent IPOs that don't have underwriter data yet (common for brand new IPOs)",
             key="opp_include_no_uw"
         )
+    with col11:
+        min_d1_volume_options = [0, 100000, 250000, 500000, 1000000, 2000000, 5000000]
+        min_d1_volume_labels = ["No filter", "100K", "250K", "500K", "1M", "2M", "5M"]
+        saved_vol = int(saved_filters.get('min_d1_volume', 0))
+        vol_idx = min_d1_volume_options.index(saved_vol) if saved_vol in min_d1_volume_options else 0
+        min_d1_volume_label = st.selectbox(
+            "Min Day 1 Volume",
+            options=min_d1_volume_labels,
+            index=vol_idx,
+            help="Filter by minimum trading volume on IPO day. Higher = more liquid/active IPOs.",
+            key="opp_min_d1_volume"
+        )
+        min_d1_volume = min_d1_volume_options[min_d1_volume_labels.index(min_d1_volume_label)]
 
     # Save as default button
     st.markdown("---")
@@ -1184,6 +1198,7 @@ def underwriter_opportunities_page():
                 'min_uw_rate_idx': min_uw_rate_options.index(min_uw_rate_filter),
                 'operation_filter_idx': operation_filter_options.index(operation_filter),
                 'include_no_uw': include_no_uw,
+                'min_d1_volume': min_d1_volume,
             }
             config['opportunity_filters'] = new_filters
             save_config(config)
@@ -1318,10 +1333,17 @@ def underwriter_opportunities_page():
         # Only include IPOs with high-success underwriters
         uw_filter = low_dollar['underwriter_clean'].isin(high_success_uw)
 
+    # Build volume filter
+    if min_d1_volume > 0 and 'd1_volume' in low_dollar.columns:
+        volume_filter = low_dollar['d1_volume'] >= min_d1_volume
+    else:
+        volume_filter = True
+
     opportunities = low_dollar[
         uw_filter &
         lifetime_filter &  # Hasn't exceeded max lifetime gain
         operation_status_filter &  # Operation status filter
+        volume_filter &  # Minimum D1 volume
         (low_dollar['close_to_target_pct'] >= min_close_to_target) &  # Got close enough to target
         (low_dollar['ipo_date_parsed'] >= cutoff_date) &
         (low_dollar['current_price'].notna()) &
@@ -1360,7 +1382,11 @@ def underwriter_opportunities_page():
     uw_filter_text = f"UW rate ≥ {effective_min_uw_rate}%" if effective_min_uw_rate > 0 else "Any UW"
     if include_no_uw:
         uw_filter_text += " (incl. no UW)"
-    filter_summary = f"Filters: Close to 2x ≥ {min_close_to_target}% | {lifetime_filter_text} | {operation_filter_text} | {uw_filter_text}"
+    volume_filter_text = f"D1 Vol ≥ {min_d1_volume:,}" if min_d1_volume > 0 else ""
+    filter_parts = [f"Close to 2x ≥ {min_close_to_target}%", lifetime_filter_text, operation_filter_text, uw_filter_text]
+    if volume_filter_text:
+        filter_parts.append(volume_filter_text)
+    filter_summary = "Filters: " + " | ".join(filter_parts)
     st.caption(filter_summary)
 
     if len(opportunities) == 0:
