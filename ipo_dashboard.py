@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v6"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v7"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -1456,6 +1456,12 @@ def underwriter_opportunities_page():
                 # Show details for failed filters
                 if 'close_to_target' in failed:
                     st.write(f"    - close_to_target_pct: {row.get('close_to_target_pct', 'N/A')}% (need >= {min_close_to_target}%)")
+                if 'lifetime_filter' in failed:
+                    st.write(f"    - lifetime_gain_pct: {row.get('lifetime_gain_pct', 'N/A')}%")
+                    st.write(f"    - max_lifetime_pct: {max_lifetime_pct}%")
+                    st.write(f"    - filter_below_ipo: {filter_below_ipo}")
+                    st.write(f"    - lifetime_high: {row.get('lifetime_high', 'N/A')}")
+                    st.write(f"    - ipo_price: {row.get('ipo_price', 'N/A')}")
                 if 'uw_filter' in failed:
                     uw = row.get('underwriter_clean', '')
                     st.write(f"    - underwriter: {uw}")
