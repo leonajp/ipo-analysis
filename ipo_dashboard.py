@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v3"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v4"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -59,7 +59,7 @@ CLICKHOUSE_CONFIG = {
     'port': int(os.environ.get('CLICKHOUSE_PORT', '443')),
     'user': os.environ.get('CLICKHOUSE_USER', 'default'),
     'password': os.environ.get('CLICKHOUSE_PASSWORD', ''),
-    'database': os.environ.get('CLICKHOUSE_DATABASE', 'ipo'),
+    'database': os.environ.get('CLICKHOUSE_DATABASE', 'market_data'),  # Changed from 'ipo' to 'market_data'
     'table': os.environ.get('CLICKHOUSE_TABLE', 'ipo_master'),
     'secure': True,
 }
