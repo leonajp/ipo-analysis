@@ -1294,6 +1294,46 @@ def underwriter_opportunities_page():
     # Filter for recent IPOs that haven't doubled
     cutoff_date = datetime.now() - timedelta(days=lookback_months * 30)
 
+    # ========================================================================
+    # DEBUG SECTION - Check why specific IPOs might be missing
+    # ========================================================================
+    with st.expander("🔍 Debug: Data & Filter Diagnostics", expanded=False):
+        st.write(f"**Data Version:** {DATA_VERSION}")
+        st.write(f"**Dashboard Version:** {DASHBOARD_VERSION}")
+        st.write(f"**Total IPOs in price range ${low_dollar_min}-${low_dollar_max}:** {len(low_dollar)}")
+        st.write(f"**Cutoff date ({lookback_months} months):** {cutoff_date.strftime('%Y-%m-%d')}")
+
+        # Check for specific tickers
+        debug_tickers = ['GCDT', 'BUDA', 'BBCQU', 'ZKPU', 'SORNU']
+        st.write(f"**Checking tickers:** {debug_tickers}")
+
+        for ticker in debug_tickers:
+            ticker_data = low_dollar[low_dollar[ticker_col] == ticker]
+            if len(ticker_data) == 0:
+                st.error(f"❌ {ticker}: NOT FOUND in low_dollar dataset")
+            else:
+                row = ticker_data.iloc[0]
+                st.write(f"**{ticker}:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"  - IPO Date: {row.get('ipo_date', 'N/A')}")
+                    st.write(f"  - IPO Date Parsed: {row.get('ipo_date_parsed', 'N/A')}")
+                    st.write(f"  - IPO Price: ${row.get('ipo_price', 'N/A')}")
+                    st.write(f"  - Current Price: ${row.get('current_price', 'N/A')}")
+                    st.write(f"  - Lifetime High: ${row.get('lifetime_high', 'N/A')}")
+                with col2:
+                    st.write(f"  - Underwriter: {row.get('underwriter_clean', 'N/A')}")
+                    st.write(f"  - Has Operation: {row.get('has_operation', 'N/A')}")
+                    st.write(f"  - D1 Volume: {row.get('d1_volume', 'N/A')}")
+
+        # Show most recent IPOs in dataset
+        st.write("**Most recent 10 IPOs in dataset:**")
+        if 'ipo_date_parsed' in low_dollar.columns:
+            recent = low_dollar.nlargest(10, 'ipo_date_parsed')[[ticker_col, 'ipo_date', 'ipo_date_parsed', 'ipo_price', 'underwriter_clean', 'current_price']].copy()
+            st.dataframe(recent)
+        else:
+            st.error("ipo_date_parsed column not found!")
+
     # Get high success underwriters (using the stricter of min_double_rate and min_uw_rate_value)
     effective_min_uw_rate = max(min_double_rate, min_uw_rate_value)
     high_success_uw = uw_stats[uw_stats['double_rate'] >= effective_min_uw_rate]['underwriter_clean'].tolist()
