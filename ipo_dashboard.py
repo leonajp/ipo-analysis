@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v2"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v3"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -1303,20 +1303,27 @@ def underwriter_opportunities_page():
     with st.expander("🔍 Debug: Data & Filter Diagnostics", expanded=False):
         st.write(f"**Data Version:** {DATA_VERSION}")
         st.write(f"**Dashboard Version:** {DASHBOARD_VERSION}")
+        st.write(f"**Total IPOs in df_analysis (before price filter):** {len(df_analysis)}")
         st.write(f"**Total IPOs in price range ${low_dollar_min}-${low_dollar_max}:** {len(low_dollar)}")
         st.write(f"**Cutoff date ({lookback_months} months):** {cutoff_date.strftime('%Y-%m-%d')}")
 
-        # Check for specific tickers
+        # Check for specific tickers in BOTH datasets
         debug_tickers = ['GCDT', 'BUDA', 'BBCQU', 'ZKPU', 'SORNU']
         st.write(f"**Checking tickers:** {debug_tickers}")
 
         for ticker in debug_tickers:
+            # Check in df_analysis first (before price filter)
+            ticker_in_analysis = df_analysis[df_analysis[ticker_col] == ticker]
             ticker_data = low_dollar[low_dollar[ticker_col] == ticker]
-            if len(ticker_data) == 0:
-                st.error(f"❌ {ticker}: NOT FOUND in low_dollar dataset")
+
+            if len(ticker_in_analysis) == 0:
+                st.error(f"❌ {ticker}: NOT in df_analysis (raw data) - NOT LOADED FROM DB")
+            elif len(ticker_data) == 0:
+                row = ticker_in_analysis.iloc[0]
+                st.warning(f"⚠️ {ticker}: In df_analysis but filtered out. Price=${row.get('ipo_price', 'N/A')} (range: ${low_dollar_min}-${low_dollar_max})")
             else:
                 row = ticker_data.iloc[0]
-                st.write(f"**{ticker}:**")
+                st.success(f"✅ {ticker}: Found in low_dollar")
                 col1, col2 = st.columns(2)
                 with col1:
                     st.write(f"  - IPO Date: {row.get('ipo_date', 'N/A')}")
@@ -1329,8 +1336,14 @@ def underwriter_opportunities_page():
                     st.write(f"  - Has Operation: {row.get('has_operation', 'N/A')}")
                     st.write(f"  - D1 Volume: {row.get('d1_volume', 'N/A')}")
 
-        # Show most recent IPOs in dataset
-        st.write("**Most recent 10 IPOs in dataset:**")
+        # Show most recent IPOs in df_analysis (raw data)
+        st.write("**Most recent 10 IPOs in df_analysis (raw from DB):**")
+        if 'ipo_date_parsed' in df_analysis.columns:
+            recent_raw = df_analysis.nlargest(10, 'ipo_date_parsed')[[ticker_col, 'ipo_date', 'ipo_date_parsed', 'ipo_price']].copy()
+            st.dataframe(recent_raw)
+
+        # Show most recent IPOs in low_dollar (after price filter)
+        st.write("**Most recent 10 IPOs in low_dollar (after price filter):**")
         if 'ipo_date_parsed' in low_dollar.columns:
             recent = low_dollar.nlargest(10, 'ipo_date_parsed')[[ticker_col, 'ipo_date', 'ipo_date_parsed', 'ipo_price', 'underwriter_clean', 'current_price']].copy()
             st.dataframe(recent)
