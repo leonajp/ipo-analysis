@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v4"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v5"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -405,11 +405,15 @@ def load_ipo_data(ch_password: str = None, _cache_key: str = None, use_clickhous
         if df is not None and len(df) > 0:
             # Map ClickHouse columns to expected dashboard columns
             df['date'] = pd.to_datetime(df['ipo_date'], errors='coerce')
-            df['ticker_clean'] = df['polygon_ticker'].fillna(df['ticker']).fillna('')
+            # Use polygon_ticker as primary, fall back to ticker column if it exists
+            if 'ticker' in df.columns:
+                df['ticker_clean'] = df['polygon_ticker'].fillna(df['ticker']).fillna('')
+            else:
+                df['ticker_clean'] = df['polygon_ticker'].fillna('')
             df['Ticker'] = df['ticker_bbg'].fillna(df['ticker_clean'] + ' US Equity')
             df['IPO Sh Px'] = df['ipo_price']
             df['IPO Sh Offered'] = df['ipo_shares_offered']
-            df['OfferSizeM'] = df['offer_size_m']
+            df['OfferSizeM'] = df.get('offer_size_m', 0)  # May not exist in market_data
             df['Prim Exch Nm'] = df['exchange']
             df['Cntry Terrtry Of Inc'] = df['country']
             df['IPO Lead'] = df['underwriter']
