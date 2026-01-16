@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v2"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -311,8 +311,11 @@ apply_custom_css()
 # DATA LOADING
 # ============================================================================
 @st.cache_data(ttl=300)  # Cache for 5 minutes
-def load_from_clickhouse(password: str = None) -> pd.DataFrame:
-    """Load IPO data directly from ClickHouse Cloud."""
+def load_from_clickhouse(password: str = None, _cache_key: str = None) -> pd.DataFrame:
+    """Load IPO data directly from ClickHouse Cloud.
+
+    Note: _cache_key is used to bust cache when DATA_VERSION changes.
+    """
     if not HAS_CLICKHOUSE:
         return None
     
@@ -398,7 +401,7 @@ def load_ipo_data(ch_password: str = None, _cache_key: str = None, use_clickhous
 
     # Load from ClickHouse
     if HAS_CLICKHOUSE:
-        df = load_from_clickhouse(ch_password)
+        df = load_from_clickhouse(ch_password, _cache_key=DATA_VERSION)
         if df is not None and len(df) > 0:
             # Map ClickHouse columns to expected dashboard columns
             df['date'] = pd.to_datetime(df['ipo_date'], errors='coerce')
