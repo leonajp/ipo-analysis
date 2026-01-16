@@ -21,7 +21,7 @@ Usage:
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
 DASHBOARD_VERSION = "2.6.0"
-DATA_VERSION = "2026-01-16-v8"  # Update this to force cache refresh on Streamlit Cloud
+DATA_VERSION = "2026-01-16-v9"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
