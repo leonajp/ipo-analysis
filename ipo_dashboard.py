@@ -20,7 +20,7 @@ Usage:
 
 # VERSION - Update when making changes to verify user has latest code
 # Also used as cache key to bust Streamlit Cloud cache when data schema changes
-DASHBOARD_VERSION = "2.6.0"
+DASHBOARD_VERSION = "2.7.0"
 DATA_VERSION = "2026-01-16-v9"  # Update this to force cache refresh on Streamlit Cloud
 
 import streamlit as st
@@ -80,6 +80,63 @@ LEGIT_UNDERWRITERS = {
     'BOFA', 'JEFFERIES', 'CREDIT SUISSE', 'UBS', 'BARCLAYS', 'DEUTSCHE',
     'WELLS FARGO', 'RBC', 'PIPER', 'STIFEL', 'WILLIAM BLAIR'
 }
+
+# ============================================================================
+# SPAC IDENTIFICATION
+# ============================================================================
+SPAC_NAME_KEYWORDS = [
+    'acquisition', 'spac', 'blank check', 'special purpose',
+    'merger corp', 'holdings corp', 'capital corp'
+]
+
+def is_spac_ipo(row) -> bool:
+    """
+    Identify if an IPO is a SPAC using multiple signals:
+    1. is_spac column from database (if available and = 1)
+    2. Name contains 'acquisition' or other SPAC keywords AND price is ~$10
+    3. Price exactly $10 AND name contains 'corp' or 'holdings'
+
+    Returns True if likely a SPAC, False otherwise.
+    """
+    # Check is_spac column first (most reliable)
+    if 'is_spac' in row.index and pd.notna(row.get('is_spac')):
+        if row['is_spac'] == 1:
+            return True
+
+    # Get name and price
+    name = str(row.get('Name', row.get('name', ''))).lower()
+
+    # Get IPO price - try multiple column names
+    ipo_price = row.get('ipo_price', row.get('ipo_price_original', row.get('IPO Sh Px', 0)))
+    if pd.isna(ipo_price):
+        ipo_price = 0
+
+    # Rule 1: Name contains SPAC keywords AND price is ~$10
+    for keyword in SPAC_NAME_KEYWORDS:
+        if keyword in name:
+            # If it has acquisition/spac in name, it's almost certainly a SPAC
+            if keyword in ['acquisition', 'spac', 'blank check', 'special purpose']:
+                return True
+            # For other keywords, require $10 price
+            if 9.5 <= ipo_price <= 10.5:
+                return True
+
+    # Rule 2: Exact $10 price + corp/holdings in name (common SPAC pattern)
+    if 9.9 <= ipo_price <= 10.1:
+        if any(term in name for term in ['corp', 'holdings', 'partners']):
+            # Additional check: typical SPAC names end in Corp or have roman numerals
+            if any(suffix in name for suffix in [' i', ' ii', ' iii', ' iv', ' v', ' corp', ' ltd']):
+                return True
+
+    return False
+
+
+def add_spac_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Add is_spac_detected column to DataFrame using SPAC identification logic."""
+    df = df.copy()
+    df['is_spac_detected'] = df.apply(is_spac_ipo, axis=1)
+    return df
+
 
 def load_config() -> dict:
     """Load saved configuration including API keys (local file)."""
@@ -1076,6 +1133,7 @@ def underwriter_opportunities_page():
         'include_no_uw': True,  # Include IPOs without underwriter data
         'volume_filter_day': 'D1',  # Which day's volume to filter (D1, D5, D10, D20)
         'min_volume': 0,  # Minimum volume for the selected day (0 = no filter)
+        'exclude_spacs': False,  # Whether to exclude SPACs from opportunities
     }
 
     # Merge saved with defaults
@@ -1180,6 +1238,13 @@ def underwriter_opportunities_page():
             help="Include recent IPOs that don't have underwriter data yet (common for brand new IPOs)",
             key="opp_include_no_uw"
         )
+    with col11:
+        exclude_spacs = st.checkbox(
+            "Exclude SPACs",
+            value=bool(saved_filters.get('exclude_spacs', False)),
+            help="Exclude SPACs (blank-check companies). SPACs are identified by: (1) is_spac flag in database, (2) 'acquisition' in name, (3) ~$10 price with typical SPAC naming patterns.",
+            key="opp_exclude_spacs"
+        )
     # Volume filter - moved to new row for better UX
     st.markdown("**📊 Volume Filter**")
     vol_col1, vol_col2 = st.columns(2)
@@ -1228,6 +1293,7 @@ def underwriter_opportunities_page():
                 'include_no_uw': include_no_uw,
                 'volume_filter_day': volume_filter_day,
                 'min_volume': min_volume,
+                'exclude_spacs': exclude_spacs,
             }
             config['opportunity_filters'] = new_filters
             save_config(config)
@@ -1267,6 +1333,10 @@ def underwriter_opportunities_page():
     if len(low_dollar) == 0:
         st.warning(f"No IPOs found in the ${low_dollar_min}-${low_dollar_max} price range")
         return
+
+    # Add SPAC identification column
+    low_dollar = add_spac_column(low_dollar)
+    spac_count = low_dollar['is_spac_detected'].sum()
 
     # Calculate metrics
     low_dollar['hit_double'] = low_dollar['lifetime_high'] >= (low_dollar['ipo_price'] * 2)
@@ -1423,6 +1493,12 @@ def underwriter_opportunities_page():
     else:
         volume_filter = True
 
+    # Build SPAC filter
+    if exclude_spacs:
+        spac_filter = ~low_dollar['is_spac_detected']
+    else:
+        spac_filter = True  # Include all (no filter)
+
     # Build individual filter conditions for debugging
     close_to_target_filter = low_dollar['close_to_target_pct'] >= min_close_to_target
     date_filter = low_dollar['ipo_date_parsed'] >= cutoff_date
@@ -1477,6 +1553,7 @@ def underwriter_opportunities_page():
         lifetime_filter &  # Hasn't exceeded max lifetime gain
         operation_status_filter &  # Operation status filter
         volume_filter &  # Minimum D1 volume
+        spac_filter &  # Exclude SPACs if checkbox is checked
         close_to_target_filter &  # Got close enough to target
         date_filter &
         current_price_filter
@@ -1515,9 +1592,12 @@ def underwriter_opportunities_page():
     if include_no_uw:
         uw_filter_text += " (incl. no UW)"
     volume_filter_text = f"{volume_filter_day} Vol ≥ {min_volume:,}" if min_volume > 0 else ""
+    spac_filter_text = f"No SPACs ({spac_count} excluded)" if exclude_spacs else ""
     filter_parts = [f"Close to 2x ≥ {min_close_to_target}%", lifetime_filter_text, operation_filter_text, uw_filter_text]
     if volume_filter_text:
         filter_parts.append(volume_filter_text)
+    if spac_filter_text:
+        filter_parts.append(spac_filter_text)
     filter_summary = "Filters: " + " | ".join(filter_parts)
     st.caption(filter_summary)
 
@@ -1644,6 +1724,112 @@ def underwriter_opportunities_page():
         - **Ops**: Operations detected (format: `count | date: $price +gain%`). Operation = volume spike (>5x median) + price >50% above IPO
         - **UW Rate**: Historical % of underwriter's low-dollar IPOs that doubled
         """)
+
+    # ========================================================================
+    # SPAC ANALYSIS SECTION
+    # ========================================================================
+    with st.expander("📊 SPAC Opening Premium vs. Long-Term Returns Analysis", expanded=False):
+        st.markdown("""
+        **Research Question:** Do SPACs that open higher above their IPO price tend to achieve better long-term returns (100%+ gain)?
+
+        This analysis examines whether the opening day premium (how much above the ~$10 IPO price a SPAC opens)
+        predicts whether it will eventually achieve a 100%+ return (doubling from IPO price).
+        """)
+
+        # Filter to SPACs only
+        spacs_df = low_dollar[low_dollar['is_spac_detected'] == True].copy()
+
+        if len(spacs_df) < 10:
+            st.warning(f"Not enough SPACs in current price range (found {len(spacs_df)}). Adjust price filter to include $10 IPOs.")
+        else:
+            # Need d1_open for opening premium calculation
+            if 'd1_open' in spacs_df.columns:
+                spacs_df['d1_open'] = pd.to_numeric(spacs_df['d1_open'], errors='coerce')
+                spacs_df = spacs_df[spacs_df['d1_open'] > 0]
+
+                # Calculate opening premium
+                spacs_df['open_premium_pct'] = ((spacs_df['d1_open'] - spacs_df['ipo_price']) / spacs_df['ipo_price']) * 100
+                spacs_df['hit_100_pct'] = spacs_df['max_gain_pct'] >= 100
+
+                # Categorize by opening premium
+                def categorize_open(pct):
+                    if pct < -5:
+                        return '<-5%'
+                    elif pct <= 0.5:
+                        return '-5% to 0.5%'
+                    elif pct <= 2:
+                        return '0.5% to 2%'
+                    elif pct <= 5:
+                        return '2% to 5%'
+                    elif pct <= 10:
+                        return '5% to 10%'
+                    else:
+                        return '>10%'
+
+                spacs_df['open_category'] = spacs_df['open_premium_pct'].apply(categorize_open)
+
+                # Summary statistics
+                st.subheader("Summary by Opening Premium Category")
+
+                summary_data = []
+                categories = ['<-5%', '-5% to 0.5%', '0.5% to 2%', '2% to 5%', '5% to 10%', '>10%']
+                for cat in categories:
+                    cat_df = spacs_df[spacs_df['open_category'] == cat]
+                    if len(cat_df) > 0:
+                        summary_data.append({
+                            'Opening Premium': cat,
+                            'Count': len(cat_df),
+                            'Hit 100%+': int(cat_df['hit_100_pct'].sum()),
+                            'Success Rate': f"{cat_df['hit_100_pct'].mean() * 100:.1f}%",
+                            'Avg Max Return': f"{cat_df['max_gain_pct'].mean():.1f}%",
+                            'Median Max Return': f"{cat_df['max_gain_pct'].median():.1f}%",
+                        })
+
+                if summary_data:
+                    summary_df = pd.DataFrame(summary_data)
+                    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+
+                # Key comparison
+                st.subheader("Key Comparison: Open >2% Above vs. Within 0.5% of IPO Price")
+
+                above_2pct = spacs_df[spacs_df['open_premium_pct'] > 2]
+                within_05pct = spacs_df[(spacs_df['open_premium_pct'] >= -0.5) & (spacs_df['open_premium_pct'] <= 0.5)]
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**SPACs Opening >2% Above IPO**")
+                    if len(above_2pct) > 0:
+                        st.metric("Count", len(above_2pct))
+                        st.metric("Hit 100%+ Return", f"{above_2pct['hit_100_pct'].sum()} ({above_2pct['hit_100_pct'].mean()*100:.1f}%)")
+                        st.metric("Avg Max Return", f"{above_2pct['max_gain_pct'].mean():.1f}%")
+                    else:
+                        st.info("No SPACs in this category")
+
+                with col2:
+                    st.markdown("**SPACs Opening Within 0.5% of IPO**")
+                    if len(within_05pct) > 0:
+                        st.metric("Count", len(within_05pct))
+                        st.metric("Hit 100%+ Return", f"{within_05pct['hit_100_pct'].sum()} ({within_05pct['hit_100_pct'].mean()*100:.1f}%)")
+                        st.metric("Avg Max Return", f"{within_05pct['max_gain_pct'].mean():.1f}%")
+                    else:
+                        st.info("No SPACs in this category")
+
+                # Conclusion
+                st.markdown("---")
+                st.markdown("**Findings:**")
+                if len(above_2pct) > 5 and len(within_05pct) > 5:
+                    rate_above = above_2pct['hit_100_pct'].mean() * 100
+                    rate_within = within_05pct['hit_100_pct'].mean() * 100
+                    if rate_above > rate_within + 5:
+                        st.success(f"SPACs that open >2% above IPO price have a **higher** 100%+ success rate ({rate_above:.1f}% vs {rate_within:.1f}%).")
+                    elif rate_within > rate_above + 5:
+                        st.warning(f"SPACs that open within 0.5% of IPO price have a **higher** 100%+ success rate ({rate_within:.1f}% vs {rate_above:.1f}%).")
+                    else:
+                        st.info(f"Opening premium does **not** strongly predict 100%+ returns. Both groups have similar success rates (~{(rate_above + rate_within)/2:.1f}%).")
+                else:
+                    st.info("Not enough data in both categories for statistical comparison.")
+            else:
+                st.warning("D1 open price data not available for opening premium analysis.")
 
     # ========================================================================
     # UNDERWRITER STATISTICS (displayed after opportunities)
